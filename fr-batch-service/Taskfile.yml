@@ -6,13 +6,6 @@ tasks:
   hello:
     cmds:
       - echo "Task works ok!!!"
-  setup-envs:
-    cmds:
-      - cp gitpod.env .env
-    # test existence of files
-    preconditions:
-      - sh: "! test -f .env"
-        msg: "==========> .env file already exists, their values will be used"
   runmocks:
     cmds:
       - PYTHONPATH=./_devenvironment/mocks/ mockintosh ./_devenvironment/mocks/mocks.yaml
@@ -26,10 +19,10 @@ tasks:
       - echo "db bootstraping finished"
   dbschema:
     cmds:
-      - mysql -p frbatchservicedb < /workspace/spring-batch-plugin-lab/fr-batch-service/_devenvironment/db/00_create_schema.sql
+      - mysql -p frbatchservicedb < {{.TASKFILE_DIR}}/_devenvironment/db/00_create_schema.sql
   dbdata:
     cmds:
-      - mysql -p frbatchservicedb < /workspace/spring-batch-plugin-lab/fr-batch-service/_devenvironment/db/01_init_data.sql
+      - mysql -p frbatchservicedb < {{.TASKFILE_DIR}}/_devenvironment/db/01_init_data.sql
   prettier:
     cmds:
       # this is a basic config for prettier for java, see pom.xml for prettier-maven-plugin
