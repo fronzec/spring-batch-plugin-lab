@@ -1,10 +1,13 @@
 # Example Batch Service
 
-A **learning and experimentation project** for Spring Batch and Spring Framework features. This repository serves as a reference implementation showcasing different approaches to solve common batch processing challenges.
+A **learning and experimentation project** for Spring Batch and Spring Framework features. This
+repository serves as a reference implementation showcasing different approaches to solve common
+batch processing challenges.
 
 ## Project Philosophy
 
-This project intentionally demonstrates **multiple ways to implement similar functionality**. You may find:
+This project intentionally demonstrates **multiple ways to implement similar functionality**. You
+may find:
 
 - Different pagination strategies (offset-based vs keyset pagination)
 - Various reader/writer implementations (JDBC vs JPA)
@@ -12,7 +15,8 @@ This project intentionally demonstrates **multiple ways to implement similar fun
 - Different error handling patterns
 - Various testing strategies
 
-This diversity is by design - it provides an easy reference for how to implement things in different ways with Spring and Spring Batch.
+This diversity is by design - it provides an easy reference for how to implement things in different
+ways with Spring and Spring Batch.
 
 ## Tech Stack
 
@@ -40,9 +44,11 @@ cd fr-batch-service
 mvn spring-boot:run -Dspring-boot.run.profiles=local
 ```
 
-The `local` profile is required. It wires a local MySQL connection (`fr_batch_local` database, root user, empty password) and runs Flyway migrations automatically at startup.
+The `local` profile is required. It wires a local MySQL connection (`fr_batch_local` database, root
+user, empty password) and runs Flyway migrations automatically at startup.
 
-For the full setup — starting MySQL, seeding data, building and loading plugins, and running the UI — see the root [RUNNING_LOCALLY.md](../RUNNING_LOCALLY.md).
+For the full setup — starting MySQL, seeding data, building and loading plugins, and running the UI
+— see the root [RUNNING_LOCALLY.md](../RUNNING_LOCALLY.md).
 
 ## How to develop
 
@@ -54,11 +60,11 @@ See [AGENTS.md](AGENTS.md) for coding standards and development guidelines.
 
 A 3-step pipeline demonstrating a complete ETL workflow:
 
-| Step | Description | Reader | Writer |
-|------|-------------|--------|--------|
-| Step 1 | CSV to Database | `FlatFileItemReader` | `JdbcBatchItemWriter` |
-| Step 2 | DB Transformation | Custom Keyset Pagination Reader | JPA Repository |
-| Step 3 | DB to REST API | `JdbcPagingItemReader` | Custom REST Writer |
+| Step   | Description       | Reader                          | Writer                |
+| ------ | ----------------- | ------------------------------- | --------------------- |
+| Step 1 | CSV to Database   | `FlatFileItemReader`            | `JdbcBatchItemWriter` |
+| Step 2 | DB Transformation | Custom Keyset Pagination Reader | JPA Repository        |
+| Step 3 | DB to REST API    | `JdbcPagingItemReader`          | Custom REST Writer    |
 
 ### Implementation Patterns Demonstrated
 
@@ -69,19 +75,19 @@ A 3-step pipeline demonstrating a complete ETL workflow:
 
 ## HTTP Web Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/batch-service/jobs/run` | POST | Trigger job execution |
-| `/api/batch-service/jobs/stop` | POST | Stop running jobs |
-| `/api/batch-service/jobs/running` | GET | List running jobs |
-| `/actuator/health` | GET | Health check |
-| `/actuator/prometheus` | GET | Prometheus metrics |
+| Endpoint                          | Method | Description           |
+| --------------------------------- | ------ | --------------------- |
+| `/api/batch-service/jobs/run`     | POST   | Trigger job execution |
+| `/api/batch-service/jobs/stop`    | POST   | Stop running jobs     |
+| `/api/batch-service/jobs/running` | GET    | List running jobs     |
+| `/actuator/health`                | GET    | Health check          |
+| `/actuator/prometheus`            | GET    | Prometheus metrics    |
 
 ## Roadmap for development experience
 
-- [ ] Easy dev environment setup using docker, docker compose or podman and podman compose, using maven wrapper and
-  reusing local m2 artifacs. Some limitations found here was the resources limitations for the DB container.
-  - [x] Development environment using gitpod
+- [ ] Easy dev environment setup using docker, docker compose or podman and podman compose, using
+  maven wrapper and reusing local m2 artifacs. Some limitations found here was the resources
+  limitations for the DB container.
 
 ## Roadmap for features included
 
@@ -92,8 +98,10 @@ A 3-step pipeline demonstrating a complete ETL workflow:
 - [ ] Web admin using svelte or react
 
 ## How to set up mock service powered by mockintosh
+
 1. Fist install `pipx` to isolate `mockintosh` environment
-2. Install `mockintosh` using pipx `pipx install mockintosh`. Latest version `0.13.17`
-3. Sometimetimes mockintosh venv doesn't work correctly by incompatible version of `markupsafe`, install a compatible version with the
-   mockintosh version using `pipx inject mockintosh markupsafe==2.0.1`
-4. Test using `mockintosh --version` command
+1. Install `mockintosh` using pipx `pipx install mockintosh`. Latest version `0.13.17`
+1. Sometimetimes mockintosh venv doesn't work correctly by incompatible version of `markupsafe`,
+   install a compatible version with the mockintosh version using
+   `pipx inject mockintosh markupsafe==2.0.1`
+1. Test using `mockintosh --version` command
