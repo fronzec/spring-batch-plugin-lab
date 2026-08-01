@@ -216,8 +216,8 @@ Seed files applied in order:
 
 ## Step 4 — Plugin Storage (automatic — no action needed)
 
-The backend stores uploaded JARs under `${user.dir}/target/local-plugins/jars/` — i.e.
-`fr-batch-service/target/local-plugins/jars/` when started via the wrapper — and **creates that directory
+The backend stores uploaded JARs under `${user.dir}/../plugin-jars/` — i.e.
+`plugin-jars/` at the repository root when started from `fr-batch-service` — and **creates that directory
 on first upload**. There is no manual `mkdir` step and no machine-specific path baked into config.
 
 > Want a different location? Override `fr-batch-service.plugins.jar-dir` in `application-local.properties`,
