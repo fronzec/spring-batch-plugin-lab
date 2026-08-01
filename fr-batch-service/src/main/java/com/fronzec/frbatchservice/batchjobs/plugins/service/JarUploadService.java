@@ -245,7 +245,7 @@ public class JarUploadService {
         String safeJobName = sanitizeNameComponent(jobName);
         String safeVersion = sanitizeNameComponent(version);
 
-        Path dir = Path.of(jarDir);
+        Path dir = Path.of(jarDir).toAbsolutePath().normalize();
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {

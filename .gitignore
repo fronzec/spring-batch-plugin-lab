@@ -38,3 +38,5 @@ build/
 
 ### graphify (generated knowledge graph — derived artifact, regenerate with /graphify) ###
 graphify-out/
+
+plugin-jars/
