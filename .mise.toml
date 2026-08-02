@@ -5,7 +5,8 @@
 #   1. Install mise           → https://mise.jdx.dev/getting-started.html
 #   2. mise trust             # approve this config
 #   3. mise install           # download the pinned versions
-# After that, `java` and `node` auto-switch to these versions inside the repo.
+# After that, `java`, `node` and `python` auto-switch to these versions inside
+# the repo. See TOOLCHAIN.md for alternatives and package-management guidance.
 #
 # Java is pinned to 21 to match <java.version>21</java.version> in the poms
 # (Spring Boot 4). Node 22 LTS satisfies Vite 8 / Vitest 4 (need >= 20.19 / 22.12).
@@ -13,3 +14,4 @@
 [tools]
 java = "temurin-21"
 node = "22"
+python = "3.11"
