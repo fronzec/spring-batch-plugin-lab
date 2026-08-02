@@ -74,7 +74,21 @@ processes:
   ui:
     description: "batch-ops-ui — Vite dev server"
     working_dir: "batch-ops-ui"
-    command: "npm install && npm run dev"
+    command: "npm install && exec npm run dev -- --host 127.0.0.1 --port 5173 --strictPort"
+    success_exit_codes: [130, 143]
+    shutdown:
+      signal: 2
+      timeout_seconds: 10
+    readiness_probe:
+      http_get:
+        host: "127.0.0.1"
+        port: 5173
+        path: "/"
+        scheme: http
+      initial_delay_seconds: 5
+      period_seconds: 3
+      timeout_seconds: 2
+      failure_threshold: 20
     depends_on:
       backend:
         condition: process_healthy

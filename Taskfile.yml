@@ -81,7 +81,7 @@ tasks:
     desc: Run the WHOLE stack (MySQL + backend + seed + plugins + UI) in one TUI via process-compose
     cmds:
       # --port 8099: process-compose's own API defaults to 8080, which the backend owns.
-      - process-compose --port 8099
+      - process-compose --port 8099 --ordered-shutdown
 
   up:
     desc: Start MySQL via Podman (machine + compose). The DB auto-creates on backend boot.
