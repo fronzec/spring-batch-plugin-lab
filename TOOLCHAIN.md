@@ -10,7 +10,7 @@ without requiring every developer to install the same tools globally.
 | Runtime versions | [mise](https://mise.jdx.dev/) | Installs and selects Java 21, Node 22, and Python 3.11 from `.mise.toml`. |
 | Java dependencies and builds | [Maven Wrapper](https://maven.apache.org/wrapper/) | Use `./fr-batch-service/mvnw`; no system Maven is required. |
 | Node dependencies and scripts | [npm](https://docs.npmjs.com/) | Uses `batch-ops-ui/package.json` and `package-lock.json`. |
-| Python CLI applications | [pipx](https://pipx.pypa.io/stable/) | Recommended for isolated tools such as `podman-compose`. |
+| Python CLI applications | [pipx](https://pipx.pypa.io/stable/) | Recommended for isolated tools such as `podman-compose`; Homebrew installation is an alternative. |
 
 The project intentionally does not require SDKMAN!, pyenv, fnm, nodenv, or
 system-wide Maven. They remain valid alternatives described below.
@@ -24,11 +24,16 @@ shell is activated inside the repository.
 ```bash
 mise trust
 mise install
+eval "$(mise activate zsh)" # add this line to ~/.zshrc for automatic activation
 
 java -version
 node --version
 python --version
 ```
+
+`mise install` downloads the configured tools but does not activate them in the
+current shell. Use `mise activate` in your shell startup, or use `mise exec` for
+individual commands.
 
 Without shell activation, run commands through mise explicitly:
 
@@ -115,6 +120,15 @@ On macOS, one supported installation is:
 brew install pipx
 pipx ensurepath
 ```
+
+Homebrew can also install `podman-compose` directly:
+
+```bash
+brew install podman-compose
+```
+
+Use either `pipx` or Homebrew, not both. The project only requires that the
+`podman-compose` command is available on `PATH`.
 
 ### Alternative: pip and virtual environments
 
