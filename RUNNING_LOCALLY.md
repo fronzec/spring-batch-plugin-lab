@@ -2,6 +2,9 @@
 
 Everything you need to go from a fresh clone to a fully operational local environment: MySQL running, backend migrated, seeds applied, all four plugins loaded, and the UI showing live data.
 
+> **Toolchain:** Runtime and package-management choices, plus alternatives for
+> Java, Node, and Python, are documented in [`TOOLCHAIN.md`](TOOLCHAIN.md).
+
 ## Quick Start (Task)
 
 If you have [Task](https://taskfile.dev) installed, the root `Taskfile.yml` wraps every step below.
@@ -50,8 +53,10 @@ tasks below.
 | npm | bundled with Node 22 | `npm -version` |
 | Task (optional) | 3.x | `task --version` |
 
-> **Easiest path — [mise](https://mise.jdx.dev):** run `mise install` at the repo root to get the
-> pinned Java 21 + Node 22 automatically (see `.mise.toml`). No manual sdkman/fnm setup needed.
+> **Easiest path — [mise](https://mise.jdx.dev):** run `mise install` at the repo root, then activate mise
+> in your shell with `eval "$(mise activate zsh)"` (see `.mise.toml`). This selects the pinned Java 21,
+> Node 22, and Python 3.11; `mise install` alone only downloads them. No manual sdkman/fnm/pyenv setup
+> needed. See [`TOOLCHAIN.md`](TOOLCHAIN.md) for alternatives and package installation guidance.
 >
 > **No Maven install needed** — every build uses the bundled wrapper `./fr-batch-service/mvnw`.
 > **No `mysql` client needed** — the seed script execs into the running DB container.

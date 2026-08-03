@@ -19,12 +19,12 @@ processes:
     description: "MySQL 8 via Podman"
     working_dir: "fr-batch-service/_devenvironment"
     # machine start errors if already running (or on Linux) — ignore. `up` (not -d)
-    # so process-compose owns the lifecycle and streams logs into its own panel.
+    # Keep podman-compose in the foreground so process-compose owns its lifecycle.
     command: "podman machine start 2>/dev/null || true; podman-compose up"
     readiness_probe:
       exec:
-        # bash /dev/tcp needs no extra client; passes once 3306 accepts connections.
-        command: "bash -c 'echo > /dev/tcp/127.0.0.1/3306'"
+        # The probe runs from the compose directory; move to the repository root first.
+        command: "cd ../.. && bash scripts/check-local-db-ready.sh"
       initial_delay_seconds: 5
       period_seconds: 3
       timeout_seconds: 2
@@ -74,7 +74,21 @@ processes:
   ui:
     description: "batch-ops-ui — Vite dev server"
     working_dir: "batch-ops-ui"
-    command: "npm install && npm run dev"
+    command: "npm install && exec npm run dev -- --host 127.0.0.1 --port 5173 --strictPort"
+    success_exit_codes: [130, 143]
+    shutdown:
+      signal: 2
+      timeout_seconds: 10
+    readiness_probe:
+      http_get:
+        host: "127.0.0.1"
+        port: 5173
+        path: "/"
+        scheme: http
+      initial_delay_seconds: 5
+      period_seconds: 3
+      timeout_seconds: 2
+      failure_threshold: 20
     depends_on:
       backend:
         condition: process_healthy

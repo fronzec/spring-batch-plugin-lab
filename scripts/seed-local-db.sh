@@ -12,14 +12,14 @@
 #   DB_PASSWORD      MySQL password         (default: empty string)
 #   MYSQL_HOST       MySQL host             (default: 127.0.0.1)   [host client mode]
 #   MYSQL_PORT       MySQL port             (default: 3306)        [host client mode]
-#   DB_CLIENT        auto | host | podman   (default: auto)
+#   DB_CLIENT        auto | host | podman   (default: auto; prefers podman)
 #   COMPOSE_PROJECT  Compose project label  (default: frbatch-local) [podman mode]
 #   COMPOSE_SERVICE  Compose service label  (default: db)            [podman mode]
 #
 # Prerequisites:
 #   - A MySQL client: either `mysql` in PATH (host mode), OR the Podman DB
 #     container running (podman mode — no host client needed). DB_CLIENT=auto
-#     picks host if available, otherwise execs into the container.
+#     prefers the running Podman container, otherwise uses a host client.
 #   - The backend must have started and run Flyway migrations at least once,
 #     otherwise the target tables do not exist yet.
 #
@@ -45,6 +45,7 @@ MYSQL_PORT="${MYSQL_PORT:-3306}"
 DB_CLIENT="${DB_CLIENT:-auto}"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-frbatch-local}"
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-db}"
+MIGRATION_TABLE="${MIGRATION_TABLE:-flyway_schema_history}"
 
 # ─── Help ─────────────────────────────────────────────────────────────────────
 usage() {
@@ -57,6 +58,7 @@ usage() {
     printf '  MYSQL_HOST   MySQL host       (default: 127.0.0.1)\n'
     printf '  MYSQL_PORT   MySQL port       (default: 3306)\n'
     printf '  DB_CLIENT    auto|host|podman (default: auto)\n'
+    printf '  MIGRATION_TABLE  Flyway table used to confirm migrations (default: %s)\n' "$MIGRATION_TABLE"
     exit 0
 }
 
@@ -65,8 +67,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 fi
 
 # ─── Resolve MySQL client ─────────────────────────────────────────────────────
-# Prefer a host `mysql` client; otherwise exec into the running Podman DB
-# container, which already ships a mysql client (no host install needed).
+# Prefer the running Podman DB container, which is the project-managed database.
+# Fall back to a host client only when no project container is running.
 find_db_container() {
     command -v podman &>/dev/null || return 0
     podman ps -q \
@@ -80,34 +82,34 @@ DB_CONTAINER=""
 case "$DB_CLIENT" in
     host)
         command -v mysql &>/dev/null || {
-            printf '[ERROR] DB_CLIENT=host but mysql client not found in PATH.\n' >&2
+            printf '❌ [ERROR] DB_CLIENT=host but mysql client not found in PATH.\n' >&2
             exit 1
         }
         CLIENT_MODE="host" ;;
     podman)
         DB_CONTAINER="$(find_db_container)"
         [[ -n "$DB_CONTAINER" ]] || {
-            printf '[ERROR] DB_CLIENT=podman but no running container for project "%s" / service "%s".\n' \
+            printf '❌ [ERROR] DB_CLIENT=podman but no running container for project "%s" / service "%s".\n' \
                 "$COMPOSE_PROJECT" "$COMPOSE_SERVICE" >&2
             exit 1
         }
         CLIENT_MODE="podman" ;;
     auto)
-        if command -v mysql &>/dev/null; then
-            CLIENT_MODE="host"
-        elif DB_CONTAINER="$(find_db_container)" && [[ -n "$DB_CONTAINER" ]]; then
+        if DB_CONTAINER="$(find_db_container)" && [[ -n "$DB_CONTAINER" ]]; then
             CLIENT_MODE="podman"
+        elif command -v mysql &>/dev/null; then
+            CLIENT_MODE="host"
         else
-            printf '[ERROR] No MySQL client available.\n' >&2
+            printf '❌ [ERROR] No MySQL client available.\n' >&2
             printf '        Install a mysql client, or start the Podman DB container:\n' >&2
             printf '          cd fr-batch-service/_devenvironment && podman-compose up -d\n' >&2
             exit 1
         fi ;;
     *)
-        printf '[ERROR] Invalid DB_CLIENT="%s" (use auto|host|podman).\n' "$DB_CLIENT" >&2
+        printf '❌ [ERROR] Invalid DB_CLIENT="%s" (use auto|host|podman).\n' "$DB_CLIENT" >&2
         exit 1 ;;
 esac
-printf '[INFO] MySQL client mode: %s%s\n' "$CLIENT_MODE" "${DB_CONTAINER:+ (container ${DB_CONTAINER})}"
+printf 'ℹ️  [INFO] MySQL client mode: %s%s\n' "$CLIENT_MODE" "${DB_CONTAINER:+ (container ${DB_CONTAINER})}"
 
 # ─── Seed files in order ──────────────────────────────────────────────────────
 declare -a SEED_FILES=(
@@ -137,36 +139,46 @@ run_mysql() {
 }
 
 # ─── Verify connectivity ──────────────────────────────────────────────────────
-printf '[INFO] Checking MySQL connectivity at %s:%s ...\n' "$MYSQL_HOST" "$MYSQL_PORT"
+printf '🔎 [INFO] Checking MySQL connectivity at %s:%s ...\n' "$MYSQL_HOST" "$MYSQL_PORT"
 if ! run_mysql -e "SELECT 1;" &>/dev/null; then
-    printf '[ERROR] Cannot connect to MySQL at %s:%s as user %s.\n' \
+    printf '❌ [ERROR] Cannot connect to MySQL at %s:%s as user %s.\n' \
         "$MYSQL_HOST" "$MYSQL_PORT" "$DB_USER" >&2
     printf '        Is the database container running? (cd fr-batch-service/_devenvironment && podman-compose up -d)\n' >&2
     exit 1
 fi
-printf '[INFO] Connected.\n'
+printf '✅ [OK] Connected.\n'
 
 # ─── Ensure database exists ───────────────────────────────────────────────────
-printf '[INFO] Ensuring database "%s" exists ...\n' "$DB_NAME"
+printf '🔎 [INFO] Ensuring database "%s" exists ...\n' "$DB_NAME"
 run_mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-printf '[INFO] Database "%s" ready.\n' "$DB_NAME"
+printf '✅ [OK] Database "%s" ready.\n' "$DB_NAME"
+
+# ─── Verify schema migrations ──────────────────────────────────────────────────
+printf '🔎 [INFO] Checking Flyway migrations in database "%s" ...\n' "$DB_NAME"
+if ! run_mysql "$DB_NAME" -N -s -e "SELECT 1 FROM information_schema.tables WHERE table_schema = '${DB_NAME}' AND table_name = '${MIGRATION_TABLE}' LIMIT 1;" | grep -qx '1'; then
+    printf '❌ [ERROR] Flyway migrations are not complete: table "%s" was not found in database "%s".\n' \
+        "$MIGRATION_TABLE" "$DB_NAME" >&2
+    printf '        Start the backend with the local profile and wait for it to become ready, then retry.\n' >&2
+    exit 1
+fi
+printf '✅ [OK] Flyway migrations detected.\n'
 
 # ─── Apply seeds ──────────────────────────────────────────────────────────────
 for seed in "${SEED_FILES[@]}"; do
     if [[ ! -f "$seed" ]]; then
-        printf '[ERROR] Seed file not found: %s\n' "$seed" >&2
+        printf '❌ [ERROR] Seed file not found: %s\n' "$seed" >&2
         exit 1
     fi
 
     filename="$(basename "$seed")"
-    printf '[INFO] Applying seed: %s ...\n' "$filename"
+    printf '🔎 [INFO] Applying seed: %s ...\n' "$filename"
 
     if run_mysql "$DB_NAME" < "$seed"; then
-        printf '[OK]   %s applied successfully.\n' "$filename"
+        printf '✅ [OK]   %s applied successfully.\n' "$filename"
     else
-        printf '[ERROR] Failed to apply %s — check the output above.\n' "$filename" >&2
+        printf '❌ [ERROR] Failed to apply %s — check the output above.\n' "$filename" >&2
         exit 1
     fi
 done
 
-printf '\n[DONE] All seeds applied to database "%s".\n' "$DB_NAME"
+printf '\n✅ [DONE] All seeds applied to database "%s".\n' "$DB_NAME"
