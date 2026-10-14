@@ -93,4 +93,11 @@
       </plugin>
     </plugins>
   </build>
+
+  <repositories>
+    <repository>
+      <id>github</id>
+      <url>https://maven.pkg.github.com/fronzec/spring-batch-plugin-lab</url>
+    </repository>
+  </repositories>
 </project>
