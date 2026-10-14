@@ -170,15 +170,16 @@ public class DynamicJobLoaderService {
           "Job \"" + entity.getJobName() + "\" (id=" + definitionId + ") is already loaded");
     }
 
-    // Mark LOADING so concurrent attempts see in-flight state
-    entity.setLoadStatus("LOADING");
-    entity.setLoadError(null);
-    jobDefinitionRepository.save(entity);
-
     long loadStartNanos = System.nanoTime();
     DynamicJobClassLoader classLoader = null;
     boolean registered = false;
     try {
+      // Mark LOADING so concurrent attempts see in-flight state. Persisting it inside the
+      // failure boundary guarantees a failed save still ends in FAILED with its original cause.
+      entity.setLoadStatus("LOADING");
+      entity.setLoadError(null);
+      jobDefinitionRepository.save(entity);
+
       // Validate JAR file exists
       File jarFile = new File(entity.getJarFilePath());
       if (!jarFile.exists()) {
