@@ -299,7 +299,13 @@ docker compose exec app du -sh /data/plugins/jars/*
 1. Identify stale/orphaned JARs (not referenced in `job_definitions` table)
 1. Remove orphaned JARs inside the container (never on the host):
    `docker compose exec app sh -c 'test -f /data/plugins/jars/{orphanId}.jar && rm /data/plugins/jars/{orphanId}.jar'`
-1. Unload and delete unused job definitions: `DELETE /jobs/definitions/{id}`
+1. Delete unused job definitions with `DELETE /jobs/definitions/{id}`; the plugin is unloaded
+   automatically and the JAR is removed after the database commit. A `409` either means the
+   definition has execution history (it cannot be deleted, even with `?force=true`; disable it with
+   `PUT /jobs/definitions/{id}/disable` instead) or that executions are running (retry later or use
+   `?force=true`; running executions are not stopped). The error message says which. If the JAR
+   cannot be removed, the delete still succeeds and the `JOB_DELETED` audit names the orphan JAR
+   path to clean up with step 2.
 1. Expand Docker volume: `docker volume create --opt size=10G plugin-jars` (requires volume
    recreation)
 

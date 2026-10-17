@@ -175,15 +175,15 @@ Roles below).
 
 ### Job Definition Management
 
-| Method   | Path                             | Auth             | Description                                |
-| -------- | -------------------------------- | ---------------- | ------------------------------------------ |
-| `POST`   | `/jobs/upload`                   | `PLUGIN_ADMIN`   | Upload a JAR and register a job definition |
-| `GET`    | `/jobs/definitions`              | `PLUGIN_VIEWER`+ | List all job definitions                   |
-| `GET`    | `/jobs/definitions/{id}`         | `PLUGIN_VIEWER`+ | Get a single definition                    |
-| `PUT`    | `/jobs/definitions/{id}/enable`  | `PLUGIN_ADMIN`   | Enable a definition                        |
-| `PUT`    | `/jobs/definitions/{id}/disable` | `PLUGIN_ADMIN`   | Disable a definition                       |
-| `DELETE` | `/jobs/definitions/{id}`         | `PLUGIN_ADMIN`   | Delete definition and JAR file             |
-| `GET`    | `/jobs/plugins`                  | Public           | List merged plugin metadata                |
+| Method   | Path                                  | Auth             | Description                                                             |
+| -------- | ------------------------------------- | ---------------- | ----------------------------------------------------------------------- |
+| `POST`   | `/jobs/upload`                        | `PLUGIN_ADMIN`   | Upload a JAR and register a job definition                              |
+| `GET`    | `/jobs/definitions`                   | `PLUGIN_VIEWER`+ | List all job definitions                                                |
+| `GET`    | `/jobs/definitions/{id}`              | `PLUGIN_VIEWER`+ | Get a single definition                                                 |
+| `PUT`    | `/jobs/definitions/{id}/enable`       | `PLUGIN_ADMIN`   | Enable a definition                                                     |
+| `PUT`    | `/jobs/definitions/{id}/disable`      | `PLUGIN_ADMIN`   | Disable a definition                                                    |
+| `DELETE` | `/jobs/definitions/{id}[?force=true]` | `PLUGIN_ADMIN`   | Unload, delete definition, then delete JAR file (see [Delete](#delete)) |
+| `GET`    | `/jobs/plugins`                       | Public           | List merged plugin metadata                                             |
 
 ### Upload
 
@@ -258,6 +258,43 @@ curl -u admin:admin123 -X POST \
 # Load all enabled
 curl -u admin:admin123 -X POST \
   http://localhost:8080/api/batch-service/jobs/load-all
+```
+
+### Delete
+
+`DELETE /jobs/definitions/{id}` is a single operation that runs under the same per-definition lock
+as load, unload, and reload, so it cannot race with them for the same ID:
+
+1. A definition with execution history (rows in `job_executions_audit`) is rejected before anything
+   is unloaded. Disable it instead (`PUT /jobs/definitions/{id}/disable`).
+1. The plugin is unloaded automatically (unregistered and its classloader released). A definition
+   that is not loaded is deleted without error.
+1. The parameter templates and the definition row are deleted in one database transaction.
+1. The JAR file is deleted only after that transaction commits.
+
+| Outcome                                                 | Response                                                               |
+| ------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Deleted                                                 | `204 No Content`                                                       |
+| Unknown ID                                              | `404 Not Found`                                                        |
+| Execution history exists (with or without `force=true`) | `409 Conflict`; nothing is unloaded or deleted; disable the definition |
+| Running executions and `force=false` (default)          | `409 Conflict`; nothing is deleted                                     |
+| Database delete fails                                   | Error response; the transaction is rolled back and the JAR is kept     |
+
+`force=true` skips only the running-execution guard; it does not stop running executions and does
+not bypass the execution-history guard. A missing JAR file does not fail the request. If the JAR
+cannot be removed after commit, the request still returns `204`, a `WARN` is logged, and the
+`JOB_DELETED` success audit names the orphan JAR path. `JOB_DELETED` is audited only once the
+outcome is known: `SUCCESS` after completion, `FAILURE` (with the definition ID and reason) when the
+delete is rejected or fails.
+
+```bash
+# Delete (fails with 409 while executions are running)
+curl -u admin:admin123 -X DELETE \
+  http://localhost:8080/api/batch-service/jobs/definitions/1
+
+# Delete even if executions are running (they are not stopped)
+curl -u admin:admin123 -X DELETE \
+  "http://localhost:8080/api/batch-service/jobs/definitions/1?force=true"
 ```
 
 ### Job Execution

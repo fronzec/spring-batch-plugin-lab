@@ -14,6 +14,7 @@ import com.fronzec.frbatchservice.batchjobs.JobsManagerService;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistryService;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
 import com.fronzec.frbatchservice.restclients.ApiClient;
 import com.fronzec.frbatchservice.restclients.DataCalculatedResponse;
 import com.fronzec.frbatchservice.web.SingleJobDataRequest;
@@ -82,6 +83,7 @@ class DynamicJobLoadingIntegrationTest {
   @Autowired private JobsManagerService jobsManagerService;
   @Autowired private PluginRegistryService pluginRegistryService;
   @Autowired private DynamicJobLoaderService loaderService;
+  @Autowired private JobExecutionAuditRepository jobExecutionAuditRepository;
 
   @MockitoBean private ApiClient apiClient;
 
@@ -433,5 +435,68 @@ class DynamicJobLoadingIntegrationTest {
         .as("stale-LOADED definition must be loaded, not skipped")
         .isEqualTo("Successfully loaded");
     assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+  }
+
+  /* ── 14. DELETE with execution history → 409 before unload, nothing changes ── */
+
+  @Test
+  @Order(14)
+  void deleteWithExecutionHistory_returnsConflict_andKeepsPluginRowAndJar() throws Exception {
+    // Test 11 executed the job, so job_executions_audit rows reference this definition.
+    // The history guard runs before unload, so even force=true must leave everything intact.
+    assertThat(jobExecutionAuditRepository.existsByJobDefinitionId(definitionId)).isTrue();
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+    Path storedJar =
+        Path.of(jobDefinitionRepository.findById(definitionId).orElseThrow().getJarFilePath());
+
+    mockMvc
+        .perform(delete(JOBS_BASE + "/definitions/" + definitionId).param("force", "true"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.status").value(409))
+        .andExpect(jsonPath("$.error").value("Conflict"))
+        .andExpect(jsonPath("$.message").value(containsString("execution history")))
+        .andExpect(jsonPath("$.path").value(JOBS_BASE + "/definitions/" + definitionId));
+
+    assertThat(jobDefinitionRepository.existsById(definitionId)).isTrue();
+    assertThat(storedJar).exists();
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+  }
+
+  /* ── 15. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */
+
+  @Test
+  @Order(15)
+  void deleteLoadedPlugin_returnsNoContent_andUnregistersJob() throws Exception {
+    // Remove the execution history that blocked test 14 so this test isolates the
+    // lifecycle behaviour of deleting a loaded plugin.
+    jobExecutionAuditRepository.deleteAll(
+        jobExecutionAuditRepository.findByJobDefinitionId(definitionId));
+    if (!pluginRegistryService.getRegisteredJobNames().contains(JOB_NAME)) {
+      loaderService.loadJob(definitionId);
+    }
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+    Path storedJar =
+        Path.of(jobDefinitionRepository.findById(definitionId).orElseThrow().getJarFilePath());
+    assertThat(storedJar).exists();
+
+    mockMvc
+        .perform(delete(JOBS_BASE + "/definitions/" + definitionId))
+        .andExpect(status().isNoContent());
+
+    assertThat(pluginRegistryService.getRegisteredJobNames()).doesNotContain(JOB_NAME);
+    assertThat(jobDefinitionRepository.existsById(definitionId)).isFalse();
+    assertThat(storedJar).doesNotExist();
+  }
+
+  /* ── 16. DELETE an unknown definition → 404 error envelope ────────────── */
+
+  @Test
+  @Order(16)
+  void deleteNonExistentDefinition_returnsNotFound() throws Exception {
+    mockMvc
+        .perform(delete(JOBS_BASE + "/definitions/99999"))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.status").value(404))
+        .andExpect(jsonPath("$.error").value("Not Found"));
   }
 }

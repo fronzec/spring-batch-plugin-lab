@@ -9,9 +9,15 @@ import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditService;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobParameterTemplateRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.util.ChecksumUtil;
 import java.io.File;
+import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -28,10 +34,11 @@ import org.springframework.context.ApplicationContext;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Orchestrates the full lifecycle of dynamically-loaded batch job plugins: load from JAR,
- * instantiate, configure, register, and unload.
+ * instantiate, configure, register, unload, and delete.
  *
  * <p>Owns the {@link DynamicJobClassLoader} lifecycle via a {@link ConcurrentHashMap} keyed by
  * definition ID. Delegates registry operations to {@link PluginRegistryService}.
@@ -48,6 +55,11 @@ public class DynamicJobLoaderService {
   private final PlatformTransactionManager transactionManager;
   private final AuditService auditService;
   private final PluginMetrics pluginMetrics;
+  private final JobParameterTemplateRepository jobParameterTemplateRepository;
+  private final JobExecutionAuditRepository jobExecutionAuditRepository;
+
+  /** Runs the database part of {@link #deleteJob} (templates + definition) as one transaction. */
+  private final TransactionTemplate deleteTransaction;
 
   /** Tracks active classloaders by definition ID for cleanup on unload. */
   private final Map<Long, DynamicJobClassLoader> classLoaders = new ConcurrentHashMap<>();
@@ -68,7 +80,9 @@ public class DynamicJobLoaderService {
       JobRepository jobRepository,
       PlatformTransactionManager transactionManager,
       AuditService auditService,
-      PluginMetrics pluginMetrics) {
+      PluginMetrics pluginMetrics,
+      JobParameterTemplateRepository jobParameterTemplateRepository,
+      JobExecutionAuditRepository jobExecutionAuditRepository) {
     this.jobDefinitionRepository = jobDefinitionRepository;
     this.pluginRegistryService = pluginRegistryService;
     this.applicationContext = applicationContext;
@@ -76,6 +90,9 @@ public class DynamicJobLoaderService {
     this.transactionManager = transactionManager;
     this.auditService = auditService;
     this.pluginMetrics = pluginMetrics;
+    this.jobParameterTemplateRepository = jobParameterTemplateRepository;
+    this.jobExecutionAuditRepository = jobExecutionAuditRepository;
+    this.deleteTransaction = new TransactionTemplate(transactionManager);
   }
 
   /**
@@ -431,6 +448,150 @@ public class DynamicJobLoaderService {
 
     return new LoadResult(
         entity.getJobName(), LoadResult.UNLOADED, "Successfully unloaded");
+  }
+
+  /**
+   * Deletes a job definition as one lifecycle-coordinated operation: unloads the plugin, deletes
+   * its parameter templates and definition row in a single database transaction, and only after
+   * that transaction commits removes the JAR file from disk.
+   *
+   * <p>The whole operation runs under the per-definition lifecycle lock, so it cannot interleave
+   * with {@link #loadJob}, {@link #unloadJob}, or {@link #reloadJob} for the same ID. A definition
+   * that is not currently loaded is deleted without error.
+   *
+   * <p>Before anything is unloaded, a definition with execution history in {@code
+   * job_executions_audit} is rejected with {@link JobDeleteConflictException}; such definitions
+   * should be disabled instead. {@code force=true} does not bypass this guard: it only skips the
+   * running-execution guard, and it does not stop running executions.
+   *
+   * <p>A missing JAR file is not an error. If the JAR cannot be removed after commit, the delete
+   * still succeeds, a warning is logged, and the {@code JOB_DELETED} success audit names the
+   * orphan JAR path. Any failure up to and including the commit emits a {@code JOB_DELETED}
+   * failure audit and propagates the original exception.
+   *
+   * @param definitionId the database ID of the job definition to delete
+   * @param force if {@code true}, skip the running-execution guard
+   * @throws NoSuchElementException if the definition does not exist
+   * @throws JobDeleteConflictException if the definition has execution history, regardless of
+   *     {@code force}; nothing is unloaded or deleted
+   * @throws JobUnloadConflictException if the job has running executions and {@code force} is
+   *     {@code false}; nothing is deleted
+   * @throws org.springframework.dao.DataAccessException if the database delete fails; the
+   *     transaction is rolled back and the JAR file is kept
+   */
+  public void deleteJob(Long definitionId, boolean force) {
+    if (jobDefinitionRepository.findById(definitionId).isEmpty()) {
+      throw new NoSuchElementException("Job definition not found for id: " + definitionId);
+    }
+    withDefinitionLock(definitionId, () -> doDeleteJob(definitionId, force));
+  }
+
+  /** Performs the actual delete while the caller owns the per-definition lifecycle lock. */
+  private void doDeleteJob(Long definitionId, boolean force) {
+    JobDefinitionEntity entity =
+        jobDefinitionRepository
+            .findById(definitionId)
+            .orElseThrow(
+                () ->
+                    new NoSuchElementException(
+                        "Job definition not found for id: " + definitionId));
+    String jobName = entity.getJobName();
+    String jarFilePath = entity.getJarFilePath();
+
+    boolean unloaded = false;
+    try {
+      // History guard runs before unload so a rejected delete leaves the plugin untouched.
+      // force only bypasses the running-execution guard, never this one.
+      if (jobExecutionAuditRepository.existsByJobDefinitionId(definitionId)) {
+        throw new JobDeleteConflictException(
+            "Job definition \""
+                + jobName
+                + "\" (id="
+                + definitionId
+                + ") has execution history and cannot be deleted; disable it instead"
+                + " (PUT /jobs/definitions/"
+                + definitionId
+                + "/disable). force=true does not bypass this check.");
+      }
+      doUnloadJob(definitionId, force);
+      unloaded = true;
+      // doUnloadJob persisted the entity as UNLOADED, so delete by id inside the transaction
+      // instead of deleting the now-stale instance read above.
+      deleteTransaction.executeWithoutResult(
+          status -> {
+            jobParameterTemplateRepository.deleteByJobDefinitionId(definitionId);
+            jobDefinitionRepository.deleteById(definitionId);
+          });
+    } catch (RuntimeException e) {
+      String outcome =
+          unloaded
+              ? "The plugin was unloaded but the definition, its parameter templates, and its"
+                  + " JAR were kept."
+              : "Nothing was deleted.";
+      log.error(
+          "Failed to delete job definition id={} jobName='{}' force={}: {}",
+          definitionId,
+          jobName,
+          force,
+          e.getMessage(),
+          e);
+      auditService.logEvent(
+          new AuditEvent(
+              AuditEventType.JOB_DELETED,
+              jobName,
+              AuditService.currentUserId(),
+              "Delete failed for job definition id="
+                  + definitionId
+                  + " (force="
+                  + force
+                  + "): "
+                  + e.getMessage()
+                  + ". "
+                  + outcome,
+              AuditEvent.FAILURE,
+              LocalDateTime.now()));
+      throw e;
+    }
+
+    String jarOutcome = deleteJarAfterCommit(definitionId, jarFilePath);
+    log.info("Job definition deleted: id={}, jobName='{}', {}", definitionId, jobName, jarOutcome);
+    auditService.logEvent(
+        new AuditEvent(
+            AuditEventType.JOB_DELETED,
+            jobName,
+            AuditService.currentUserId(),
+            "Job definition deleted: id=" + definitionId + " (force=" + force + "); " + jarOutcome,
+            AuditEvent.SUCCESS,
+            LocalDateTime.now()));
+  }
+
+  /**
+   * Removes the JAR file after the delete transaction committed. File-system problems never fail
+   * the delete: the definition is already gone, so the JAR is reported as an orphan instead.
+   *
+   * @return a human-readable JAR outcome for the success audit detail
+   */
+  private String deleteJarAfterCommit(Long definitionId, String jarFilePath) {
+    if (jarFilePath == null || jarFilePath.isBlank()) {
+      log.warn("Job definition id={} had no JAR path; nothing to remove from disk", definitionId);
+      return "no JAR path recorded";
+    }
+    try {
+      if (Files.deleteIfExists(Path.of(jarFilePath))) {
+        log.info("JAR file deleted from disk: {}", jarFilePath);
+        return "JAR deleted: " + jarFilePath;
+      }
+      log.info("JAR file already absent from disk: {}", jarFilePath);
+      return "JAR already absent: " + jarFilePath;
+    } catch (IOException | InvalidPathException | SecurityException e) {
+      log.warn(
+          "Job definition id={} deleted but its JAR could not be removed; orphan JAR left on"
+              + " disk: {} ({})",
+          definitionId,
+          jarFilePath,
+          e.toString());
+      return "orphan JAR left on disk: " + jarFilePath + " (" + e + ")";
+    }
   }
 
   /**

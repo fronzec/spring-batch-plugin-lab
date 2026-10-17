@@ -1,6 +1,7 @@
 /* 2024-2025 */
 package com.fronzec.frbatchservice.web;
 
+import com.fronzec.frbatchservice.batchjobs.plugins.loader.JobDeleteConflictException;
 import com.fronzec.frbatchservice.batchjobs.plugins.loader.JobLoadException;
 import com.fronzec.frbatchservice.batchjobs.plugins.loader.JobUnloadConflictException;
 import com.fronzec.frbatchservice.batchjobs.plugins.service.DuplicateJobDefinitionException;
@@ -109,6 +110,18 @@ public class GlobalExceptionHandler {
   public ResponseEntity<ErrorResponse> handleUnloadConflict(
       JobUnloadConflictException ex, HttpServletRequest request) {
     log.warn("Job unload conflict: {}", ex.getMessage());
+    return ResponseEntity.status(HttpStatus.CONFLICT)
+        .body(buildError(409, "Conflict", ex.getMessage(), request));
+  }
+
+  /**
+   * Maps {@link JobDeleteConflictException} — a definition that cannot be deleted, such as one
+   * with execution history; {@code force} does not bypass it — to {@code 409 Conflict}.
+   */
+  @ExceptionHandler(JobDeleteConflictException.class)
+  public ResponseEntity<ErrorResponse> handleDeleteConflict(
+      JobDeleteConflictException ex, HttpServletRequest request) {
+    log.warn("Job delete conflict: {}", ex.getMessage());
     return ResponseEntity.status(HttpStatus.CONFLICT)
         .body(buildError(409, "Conflict", ex.getMessage(), request));
   }

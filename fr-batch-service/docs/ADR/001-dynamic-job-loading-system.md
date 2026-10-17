@@ -722,27 +722,27 @@ public class JobManagementController {
         return ResponseEntity.ok(JobDefinitionDto.from(jobDef));
     }
 
-    @DeleteMapping("/{jobName}")
-    public ResponseEntity<StatusResponse> deleteJob(@PathVariable String jobName) {
-        JobDefinition jobDef = jobDefinitionRepository.findByJobName(jobName)
-            .orElseThrow(() -> new JobNotFoundException(jobName));
-
-        // Unload if loaded
-        jobLoaderService.unloadJob(jobName);
-
-        // Delete JAR file
-        try {
-            Files.deleteIfExists(Paths.get(jobDef.getJarFilePath()));
-        } catch (IOException e) {
-            log.warn("Failed to delete JAR file", e);
-        }
-
-        // Delete from database
-        jobDefinitionRepository.delete(jobDef);
-
-        return ResponseEntity.ok(StatusResponse.success("Job deleted"));
+    // Implemented as DELETE /jobs/definitions/{id}[?force=true] -> 204 No Content,
+    // delegating to DynamicJobLoaderService.deleteJob(id, force).
+    @DeleteMapping("/definitions/{id}")
+    public ResponseEntity<Void> deleteDefinition(
+            @PathVariable long id, @RequestParam(defaultValue = "false") boolean force) {
+        jobLoaderService.deleteJob(id, force);
+        return ResponseEntity.noContent().build();
     }
 }
+
+// DynamicJobLoaderService.deleteJob(id, force), all under the per-definition lifecycle lock:
+//   1. Unknown id -> NoSuchElementException (404).
+//   2. Execution history in job_executions_audit -> JobDeleteConflictException (409) before
+//      anything is unloaded; force=true does not bypass it. Disable the definition instead.
+//   3. Unload (reuses the unload path): running executions without force -> 409, nothing
+//      deleted; force=true skips the guard but does not stop running executions.
+//   4. One transaction: delete parameter templates, then the definition row.
+//   5. After commit: Files.deleteIfExists(jar). A missing JAR is fine; an I/O failure still
+//      succeeds, logs WARN, and names the orphan JAR in the audit detail.
+//   6. Audit JOB_DELETED SUCCESS only after completion; any failure up to the commit audits
+//      JOB_DELETED FAILURE with id, jobName, and reason, then rethrows.
 ```
 
 ### 6. Example Job Plugin Project
