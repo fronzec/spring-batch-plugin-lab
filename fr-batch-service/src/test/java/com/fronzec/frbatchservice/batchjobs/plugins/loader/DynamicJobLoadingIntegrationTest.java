@@ -13,6 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.fronzec.frbatchservice.batchjobs.JobsManagerService;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistryService;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
+import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobExecutionAuditEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
 import com.fronzec.frbatchservice.restclients.ApiClient;
@@ -22,13 +23,20 @@ import java.io.*;
 import java.math.BigDecimal;
 import java.net.URL;
 import java.nio.file.*;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import org.junit.jupiter.api.*;
+import org.springframework.batch.core.BatchStatus;
 import org.springframework.batch.core.ExitStatus;
+import org.springframework.batch.core.job.JobExecution;
+import org.springframework.batch.core.job.parameters.JobParameters;
+import org.springframework.batch.core.job.parameters.JobParametersBuilder;
+import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
@@ -84,6 +92,7 @@ class DynamicJobLoadingIntegrationTest {
   @Autowired private PluginRegistryService pluginRegistryService;
   @Autowired private DynamicJobLoaderService loaderService;
   @Autowired private JobExecutionAuditRepository jobExecutionAuditRepository;
+  @Autowired private JobRepository jobRepository;
 
   @MockitoBean private ApiClient apiClient;
 
@@ -189,6 +198,43 @@ class DynamicJobLoadingIntegrationTest {
         JAR_FILENAME,
         MediaType.APPLICATION_OCTET_STREAM_VALUE,
         Files.readAllBytes(testJarPath));
+  }
+
+  /* ── Helpers: execution audit lookups ──────────────────────────────────── */
+
+  private static JobParameters identifyingParams(String attemptNumber) {
+    return new JobParametersBuilder()
+        .addString("DATE", LocalDate.now().toString())
+        .addString("ATTEMPT_NUMBER", attemptNumber)
+        .toJobParameters();
+  }
+
+  private List<JobExecutionAuditEntity> auditRowsFor(long jobExecutionId) {
+    return jobExecutionAuditRepository.findByJobDefinitionId(definitionId).stream()
+        .filter(row -> row.getJobExecutionId() == jobExecutionId)
+        .toList();
+  }
+
+  private JobExecutionAuditEntity singleAuditRow(long jobExecutionId) {
+    List<JobExecutionAuditEntity> rows = auditRowsFor(jobExecutionId);
+    assertThat(rows).as("audit rows for job execution %d", jobExecutionId).hasSize(1);
+    return rows.get(0);
+  }
+
+  /** Polls (bounded) until the async execution's single audit row carries its finish time. */
+  private JobExecutionAuditEntity awaitFinishedAuditRow(long jobExecutionId)
+      throws InterruptedException {
+    long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+    while (System.nanoTime() < deadline) {
+      List<JobExecutionAuditEntity> rows = auditRowsFor(jobExecutionId);
+      if (rows.size() == 1
+          && rows.get(0).getExecutionMetadata() != null
+          && rows.get(0).getExecutionMetadata().contains("finishedAt")) {
+        return rows.get(0);
+      }
+      Thread.sleep(100);
+    }
+    return singleAuditRow(jobExecutionId); // fails with a descriptive message, or returns the row
   }
 
   /* ── 1. Upload valid plugin ────────────────────────────────────────────── */
@@ -372,12 +418,41 @@ class DynamicJobLoadingIntegrationTest {
 
     assertEquals(ExitStatus.COMPLETED.toString(), result.get("result"),
         "Dynamic plugin job should complete successfully");
+
+    // The audit listener attached at registration is the single writer: exactly one finished row.
+    JobExecution execution = jobRepository.getLastJobExecution(JOB_NAME, identifyingParams("1"));
+    assertThat(execution).isNotNull();
+    JobExecutionAuditEntity row = singleAuditRow(execution.getId());
+    assertThat(row.getJobDefinitionId()).isEqualTo(definitionId);
+    assertThat(row.getExecutionMetadata()).contains("finishedAt", "durationMs", "COMPLETED");
   }
 
-  /* ── 12. Load-all → loads unloaded definitions ─────────────────────────── */
+  /* ── 12. Async launch of the dynamic plugin is audited exactly once ────── */
 
   @Test
   @Order(12)
+  void dynamicPlugin_asyncLaunch_writesExactlyOneFinishedAuditRow() throws InterruptedException {
+    SingleJobDataRequest request = new SingleJobDataRequest();
+    request.setJobBeanName(JOB_NAME);
+    request.setParam("DATE", LocalDate.now().toString());
+    request.setParam("ATTEMPT_NUMBER", "2");
+
+    Map<String, String> result = jobsManagerService.asyncRunJobWithParams(request);
+    assertThat(result).doesNotContainKey("error");
+
+    JobExecution execution = jobRepository.getLastJobExecution(JOB_NAME, identifyingParams("2"));
+    assertThat(execution).as("async launch must create a job execution").isNotNull();
+    JobExecutionAuditEntity row = awaitFinishedAuditRow(execution.getId());
+    assertThat(row.getJobDefinitionId()).isEqualTo(definitionId);
+    assertThat(row.getExecutionMetadata()).contains("durationMs", "COMPLETED");
+    assertThat(jobRepository.getJobExecution(execution.getId()).getStatus())
+        .isEqualTo(BatchStatus.COMPLETED);
+  }
+
+  /* ── 13. Load-all → loads unloaded definitions ─────────────────────────── */
+
+  @Test
+  @Order(13)
   void loadAll_loadsUnloadedDefinitions() throws Exception {
     // First, reload to ensure the definition is LOADED, then unload it so
     // load-all has something to pick up.
@@ -399,10 +474,10 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(body).contains("\"message\":\"Successfully loaded\"");
   }
 
-  /* ── 13. Auto-load re-instantiates definitions with stale LOADED status ── */
+  /* ── 14. Auto-load re-instantiates definitions with stale LOADED status ── */
 
   @Test
-  @Order(13)
+  @Order(14)
   void loadAllEnabled_reloadsDefinitionWithStaleLoadedStatus() {
     // Simulate a backend restart: the database still says LOADED from a previous
     // JVM, but the in-memory registry is empty. Auto-load must actually load the
@@ -437,12 +512,12 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
   }
 
-  /* ── 14. DELETE with execution history → 409 before unload, nothing changes ── */
+  /* ── 15. DELETE with execution history → 409 before unload, nothing changes ── */
 
   @Test
-  @Order(14)
+  @Order(15)
   void deleteWithExecutionHistory_returnsConflict_andKeepsPluginRowAndJar() throws Exception {
-    // Test 11 executed the job, so job_executions_audit rows reference this definition.
+    // Tests 11 and 12 executed the job, so job_executions_audit rows reference this definition.
     // The history guard runs before unload, so even force=true must leave everything intact.
     assertThat(jobExecutionAuditRepository.existsByJobDefinitionId(definitionId)).isTrue();
     assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
@@ -462,12 +537,12 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
   }
 
-  /* ── 15. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */
+  /* ── 16. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */
 
   @Test
-  @Order(15)
+  @Order(16)
   void deleteLoadedPlugin_returnsNoContent_andUnregistersJob() throws Exception {
-    // Remove the execution history that blocked test 14 so this test isolates the
+    // Remove the execution history that blocked test 15 so this test isolates the
     // lifecycle behaviour of deleting a loaded plugin.
     jobExecutionAuditRepository.deleteAll(
         jobExecutionAuditRepository.findByJobDefinitionId(definitionId));
@@ -488,10 +563,10 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(storedJar).doesNotExist();
   }
 
-  /* ── 16. DELETE an unknown definition → 404 error envelope ────────────── */
+  /* ── 17. DELETE an unknown definition → 404 error envelope ────────────── */
 
   @Test
-  @Order(16)
+  @Order(17)
   void deleteNonExistentDefinition_returnsNotFound() throws Exception {
     mockMvc
         .perform(delete(JOBS_BASE + "/definitions/99999"))

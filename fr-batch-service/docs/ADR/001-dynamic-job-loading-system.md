@@ -351,6 +351,13 @@ CREATE TABLE job_executions_audit (
 );
 ```
 
+`job_executions_audit` has a single writer: `JobExecutionAuditListener`, which
+`PluginRegistryService` appends to every job (static and dynamic) right before
+`JobRegistry.register(job)`, so every launch path, sync or async, is audited. `beforeJob` inserts
+the row with the start time; `afterJob` adds the finish time, duration, and the outcome as the raw
+`BatchStatus` name (`COMPLETED`, `FAILED`, `STOPPED`, ...). Jobs without a `job_definitions` row
+are not audited, and audit failures never fail the job.
+
 ### 3. Dynamic ClassLoader Strategy
 
 **Parent-Last Delegation Model:**
@@ -1235,7 +1242,8 @@ results. Fixed in `DynamicJobLoaderService.unloadJob()` with try-catch guard. Se
   unit tests
 - [x] **Audit service + JobExecutionListener** — `AuditEventType` enum (8 lifecycle events),
   `AuditEvent` record, `AuditService` with SLF4J structured JSON logging + MDC correlation IDs;
-  `JobExecutionAuditListener` populates `job_executions_audit` on job start/end; `createdBy`
+  `JobExecutionAuditListener` populates `job_executions_audit` on job start/end (attached to every
+  job at registration since #111, the table's only writer); `createdBy`
   populated via `SecurityContext` resolver with `"system"` fallback; wired into `JarUploadService`,
   `DynamicJobLoaderService`, `JobManagementController`
 - [x] **8 Snyk CVEs resolved** — `spring-boot-starter-security` fixed `CVE-2024-38807` (DoS in

@@ -3,16 +3,10 @@ package com.fronzec.frbatchservice.batchjobs;
 
 import com.fronzec.api.BatchJobPlugin;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistryService;
-import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
-import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobExecutionAuditEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
-import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
-import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
 import com.fronzec.frbatchservice.utils.JsonUtils;
 import com.fronzec.frbatchservice.web.SingleJobDataRequest;
-import java.time.Duration;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -44,8 +38,6 @@ public class JobsManagerService {
     private final PluginRegistryService pluginRegistryService;
     private final JobRepository jobRepository;
     private final PluginMetrics pluginMetrics;
-    private final JobDefinitionRepository jobDefinitionRepository;
-    private final JobExecutionAuditRepository auditRepository;
 
     public JobsManagerService(
             JobOperator asyncJobLauncher,
@@ -53,17 +45,13 @@ public class JobsManagerService {
             JobRegistry jobRegistry,
             PluginRegistryService pluginRegistryService,
             JobRepository jobRepository,
-            PluginMetrics pluginMetrics,
-            JobDefinitionRepository jobDefinitionRepository,
-            JobExecutionAuditRepository auditRepository) {
+            PluginMetrics pluginMetrics) {
         this.asyncJobLauncher = asyncJobLauncher;
         this.syncJobLauncher = syncJobLauncher;
         this.jobRegistry = jobRegistry;
         this.pluginRegistryService = pluginRegistryService;
         this.jobRepository = jobRepository;
         this.pluginMetrics = pluginMetrics;
-        this.jobDefinitionRepository = jobDefinitionRepository;
-        this.auditRepository = auditRepository;
     }
 
     public HashMap<String, String> launchAllNonAutoDetectedJobsAsync(
@@ -243,7 +231,6 @@ public class JobsManagerService {
                     "parameters",
                     JsonUtils.parseObject2Json(jobParametersBuilder.toJobParameters()));
             launchedJobMetadata.put("result", run.getExitStatus().toString());
-            saveAudit(run, request.getJobBeanName());
         } catch (JobExecutionAlreadyRunningException e) {
             logger.error("already running job with the same params", e);
             launchedJobMetadata.put("error", e.getMessage());
@@ -303,26 +290,5 @@ public class JobsManagerService {
                             running.put(key, tmp);
                         });
         return running;
-    }
-
-    private void saveAudit(JobExecution execution, String jobName) {
-        try {
-            JobDefinitionEntity def = jobDefinitionRepository.findByJobName(jobName).orElse(null);
-            if (def == null) return;
-            JobExecutionAuditEntity entity = new JobExecutionAuditEntity();
-            entity.setJobDefinitionId(def.getId());
-            entity.setJobExecutionId(execution.getId());
-            entity.setJobVersion(def.getVersion());
-            long durationMs = Duration.between(execution.getStartTime(),
-                    execution.getEndTime() != null ? execution.getEndTime() : LocalDateTime.now())
-                    .toMillis();
-            entity.setExecutionMetadata(
-                    "{\"outcome\":\"" + execution.getExitStatus().getExitCode() + "\","
-                    + "\"durationMs\":" + durationMs + "}");
-            auditRepository.save(entity);
-            logger.debug("Audit saved for job '{}': {}", jobName, execution.getExitStatus().getExitCode());
-        } catch (Exception e) {
-            logger.warn("Failed to save audit for '{}': {}", jobName, e.getMessage());
-        }
     }
 }
