@@ -1,0 +1,47 @@
+name: Improvement or follow-up
+description: Propose a feature, improvement, or follow-up task with clear acceptance criteria.
+title: "feat(<area>): <summary>"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Description
+      description: What is wrong or missing today? Reference code locations or issues when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: The intended behavior or approach.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Observable outcomes that make this issue done.
+    validations:
+      required: true
+  - type: input
+    id: area
+    attributes:
+      label: Affected Area
+      description: Module or capability affected (for example, plugin lifecycle or batch-ops-ui).
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of Scope
+      description: What this issue deliberately does not cover.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Related issues, PRs, decisions, or links.
+    validations:
+      required: false
