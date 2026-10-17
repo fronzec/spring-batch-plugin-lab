@@ -49,7 +49,7 @@ public class JobsManagerServiceTest {
         jobsManagerService =
                 new JobsManagerService(
                     jobOperator, jobOperator, jobRegistry, pluginRegistryService, null,
-                    pluginMetrics, null, null);
+                    pluginMetrics);
     }
 
     @Test

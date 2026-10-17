@@ -333,6 +333,16 @@ curl -u admin:admin123 \
 | `execution_attempt_number` | Yes      | Unique attempt number            |
 | `description`              | No       | Non-identifying descriptor       |
 
+**Execution audit history**: every launch path above (single or all, sync or async) writes exactly
+one `job_executions_audit` row per job execution. The only writer is `JobExecutionAuditListener`,
+which the platform attaches to every plugin job at registration time (alongside any listeners the
+plugin attached itself). The row records the start time when the job starts, then the finish time,
+duration in milliseconds, and the outcome, which is the execution's Spring Batch `BatchStatus` name
+(`COMPLETED`, `FAILED`, `STOPPED`, ...). Jobs without a `job_definitions` row (for example,
+classpath-only jobs) are not audited. Audit write failures are logged and never fail the job. A
+plugin whose `configureJob(...)` returns a `Job` that is not a Spring Batch `AbstractJob` still
+registers, but its executions are not audited and a `WARN` is logged.
+
 ______________________________________________________________________
 
 ## JAR Signing Configuration

@@ -2,6 +2,7 @@ package com.fronzec.frbatchservice.batchjobs.plugins;
 
 import com.fronzec.api.BatchJobPlugin;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
+import com.fronzec.frbatchservice.batchjobs.plugins.listener.JobExecutionAuditListener;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
 import jakarta.annotation.PostConstruct;
 import java.util.Collection;
@@ -16,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.batch.core.configuration.DuplicateJobException;
 import org.springframework.batch.core.configuration.JobRegistry;
+import org.springframework.batch.core.job.AbstractJob;
 import org.springframework.batch.core.job.Job;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.context.ApplicationContext;
@@ -28,6 +30,9 @@ import org.springframework.transaction.PlatformTransactionManager;
  *
  * <p>Registration runs in {@link PostConstruct}, which Spring guarantees completes before any
  * consumer bean that constructor-injects this service is made available to the HTTP layer.
+ *
+ * <p>Every job, static or dynamic, receives the {@link JobExecutionAuditListener} right before it
+ * enters the {@link JobRegistry}; that listener is the single writer of execution audit history.
  */
 @Service
 public class PluginRegistryService {
@@ -40,6 +45,7 @@ public class PluginRegistryService {
     private final PlatformTransactionManager transactionManager;
     private final ApplicationContext applicationContext;
     private final JobDefinitionRepository jobDefinitionRepository;
+    private final JobExecutionAuditListener auditListener;
 
     /** Built during {@link PostConstruct} and dynamic registration; mutable. */
     private final Map<String, BatchJobPlugin> pluginsByJobName = new LinkedHashMap<>();
@@ -51,13 +57,15 @@ public class PluginRegistryService {
             JobRepository jobRepository,
             PlatformTransactionManager transactionManager,
             ApplicationContext applicationContext,
-            JobDefinitionRepository jobDefinitionRepository) {
+            JobDefinitionRepository jobDefinitionRepository,
+            JobExecutionAuditListener auditListener) {
         this.plugins = plugins;
         this.jobRegistry = jobRegistry;
         this.jobRepository = jobRepository;
         this.transactionManager = transactionManager;
         this.applicationContext = applicationContext;
         this.jobDefinitionRepository = jobDefinitionRepository;
+        this.auditListener = auditListener;
     }
 
     @PostConstruct
@@ -101,7 +109,8 @@ public class PluginRegistryService {
                         e);
             }
 
-            // 3. Register into the shared JobRegistry
+            // 3. Attach the execution audit listener, then register into the shared JobRegistry
+            attachAuditListener(job);
             try {
                 jobRegistry.register(job);
             } catch (DuplicateJobException e) {
@@ -204,6 +213,7 @@ public class PluginRegistryService {
                         e);
             }
 
+            attachAuditListener(job);
             try {
                 jobRegistry.register(job);
             } catch (DuplicateJobException e) {
@@ -218,6 +228,31 @@ public class PluginRegistryService {
                     "Dynamically registered plugin job '{}' from {}",
                     name,
                     plugin.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * Appends the shared {@link JobExecutionAuditListener} to the job so every launch path writes
+     * its execution audit row through one writer.
+     *
+     * <p>Uses {@link AbstractJob#registerJobExecutionListener}, which appends and keeps the
+     * listeners the plugin attached itself (never {@code setJobExecutionListeners}, which replaces
+     * them). Spring Batch ignores a listener that is already registered on the same job instance,
+     * so re-registering a job cannot attach the audit listener twice. A {@link Job} that is not an
+     * {@link AbstractJob} cannot accept listeners: it is still registered, but its executions are
+     * not audited.
+     *
+     * @param job the job produced by the plugin's {@code configureJob(...)}
+     */
+    private void attachAuditListener(Job job) {
+        if (job instanceof AbstractJob abstractJob) {
+            abstractJob.registerJobExecutionListener(auditListener);
+        } else {
+            log.warn(
+                    "Job '{}' ({}) is not an AbstractJob; registering it without the execution audit"
+                            + " listener, so its executions will not be audited",
+                    job.getName(),
+                    job.getClass().getName());
         }
     }
 
