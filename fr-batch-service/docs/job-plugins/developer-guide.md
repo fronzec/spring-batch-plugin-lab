@@ -307,12 +307,13 @@ parameter templates stay linked. It is a multipart request with the same fields 
 
 The operation runs under the same per-definition lock as load, unload, reload, and delete:
 
-1. The plugin is unloaded first, without force. Running executions reject the replacement and
-   nothing changes.
-1. The new JAR is validated like an upload (`.jar` extension, ZIP magic bytes, fully-qualified main
-   class name, signature policy) and must contain the main class entry. No plugin code runs at this
-   point. It is stored under a unique file name (`{jobName}-{version}-{random}.jar`), so the current
-   JAR is never overwritten.
+1. The new JAR is validated first, like an upload (`.jar` extension, ZIP magic bytes,
+   fully-qualified main class name, signature policy), and must contain the main class entry. No
+   plugin code runs at this point. It is stored under a unique file name
+   (`{jobName}-{version}-{random}.jar`), so the current JAR is never overwritten. An invalid JAR
+   changes nothing: the plugin stays loaded if it was loaded.
+1. The plugin is then unloaded, without force. Running executions reject the replacement; the new
+   JAR is discarded and nothing else changes.
 1. One database transaction updates the JAR path, checksum, version, and main class, and resets the
    approval to `PENDING`. The definition stays `UNLOADED`; `enabled` is unchanged. In non-production
    profiles the auto-approval is applied again after commit, as on upload.
@@ -325,8 +326,8 @@ again. Loading still checks that the plugin's job name matches the definition.
 | --------------------- | ------------------------------------------------------------------------ |
 | Replaced              | `200 OK` with the updated definition                                     |
 | Unknown ID            | `404 Not Found`                                                          |
-| Running executions    | `409 Conflict`; nothing is unloaded or changed                           |
-| Invalid JAR           | `400 Bad Request`; the definition keeps its JAR but stays unloaded       |
+| Running executions    | `409 Conflict`; new JAR discarded, nothing is unloaded or changed        |
+| Invalid JAR           | `400 Bad Request`; the definition and the plugin are unchanged           |
 | Database update fails | Error response; rolled back, new JAR deleted, current JAR kept, unloaded |
 
 A missing previous JAR does not fail the request. If the previous JAR cannot be removed after

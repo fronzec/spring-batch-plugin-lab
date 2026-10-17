@@ -848,7 +848,7 @@ class DynamicJobLoaderServiceTest {
   }
 
   @Test
-  void replaceJar_loadedPlugin_unloadsUpdatesDefinitionResetsApprovalThenDeletesOldJar()
+  void replaceJar_loadedPlugin_storesThenUnloadsUpdatesDefinitionResetsApprovalThenDeletesOldJar()
       throws Exception {
     JobDefinitionEntity entity = createEntity(60L, "replace-job", true, LoadResult.LOADED);
     entity.setVersion("1.0.0");
@@ -877,9 +877,9 @@ class DynamicJobLoaderServiceTest {
         service.replaceJar(60L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS);
 
     InOrder order = inOrder(pluginRegistryService, jarUploadService, transactionManager);
-    order.verify(pluginRegistryService).unregisterDynamicPlugin("replace-job");
     order.verify(jarUploadService)
         .storeReplacementJar(replacementUpload, "replace-job", NEW_VERSION, NEW_MAIN_CLASS);
+    order.verify(pluginRegistryService).unregisterDynamicPlugin("replace-job");
     order.verify(transactionManager).commit(any());
     order.verify(jarUploadService).autoApproveIfEnabled(result);
     verify(classLoader).cleanup();
@@ -941,26 +941,33 @@ class DynamicJobLoaderServiceTest {
   }
 
   @Test
-  void replaceJar_runningExecutions_throwsConflictAndChangesNothing() throws Exception {
+  void replaceJar_runningExecutions_throwsConflictDiscardsNewJarAndChangesNothing()
+      throws Exception {
     JobDefinitionEntity entity = createEntity(62L, "replace-running-job", true, LoadResult.LOADED);
     DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
     classLoadersOf(service).put(62L, classLoader);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-running-job");
 
     when(jobDefinitionRepository.findById(62L)).thenReturn(Optional.of(entity));
     when(jobRepository.findRunningJobExecutions("replace-running-job"))
         .thenReturn(Set.of(mock(JobExecution.class)));
+    // The new JAR is validated and stored before the unload rejects the running executions.
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
 
     assertThrows(
         JobUnloadConflictException.class,
         () -> service.replaceJar(62L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
 
-    verifyNoInteractions(jarUploadService, transactionManager);
+    verifyNoInteractions(transactionManager);
+    verify(jarUploadService, never()).autoApproveIfEnabled(any());
     verify(pluginRegistryService, never()).unregisterDynamicPlugin(any());
     verify(classLoader, never()).cleanup();
     assertSame(classLoader, classLoadersOf(service).get(62L));
     verify(jobDefinitionRepository, never()).save(any());
     assertEquals(validJarPath, entity.getJarFilePath());
+    assertEquals(LoadResult.LOADED, entity.getLoadStatus(), "the plugin must stay loaded");
     assertTrue(Files.exists(Path.of(validJarPath)), "Current JAR must be kept on conflict");
+    assertFalse(Files.exists(newJar.path()), "The stored new JAR must be discarded on conflict");
     try (var files = Files.list(tempDir)) {
       assertEquals(1, files.count(), "No new JAR may be left behind");
     }
@@ -971,17 +978,18 @@ class DynamicJobLoaderServiceTest {
     assertTrue(replaced.details().contains("id=62"), replaced.details());
     assertTrue(replaced.details().contains("running execution"), replaced.details());
     assertTrue(replaced.details().contains("Nothing was changed"), replaced.details());
+    assertTrue(replaced.details().contains(newJar.path() + " was deleted"), replaced.details());
   }
 
   @Test
-  void replaceJar_invalidJar_throwsAndKeepsDefinitionAndCurrentJar() throws Exception {
-    JobDefinitionEntity entity = createEntity(63L, "replace-invalid-job", true, null);
+  void replaceJar_invalidJar_throwsAndKeepsLoadedPluginDefinitionAndCurrentJar() throws Exception {
+    JobDefinitionEntity entity = createEntity(63L, "replace-invalid-job", true, LoadResult.LOADED);
     entity.setVersion("1.0.0");
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(63L, classLoader);
     InvalidJarException invalid = new InvalidJarException("Main class not found in JAR");
 
     when(jobDefinitionRepository.findById(63L)).thenReturn(Optional.of(entity));
-    when(jobRepository.findRunningJobExecutions("replace-invalid-job"))
-        .thenReturn(Collections.emptySet());
     when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenThrow(invalid);
 
     InvalidJarException thrown =
@@ -992,22 +1000,28 @@ class DynamicJobLoaderServiceTest {
     assertSame(invalid, thrown);
     verifyNoInteractions(transactionManager);
     verify(jarUploadService, never()).autoApproveIfEnabled(any());
+    verify(pluginRegistryService, never()).unregisterDynamicPlugin(any());
+    verify(classLoader, never()).cleanup();
+    assertSame(classLoader, classLoadersOf(service).get(63L), "the plugin must stay loaded");
+    verify(jobDefinitionRepository, never()).save(any());
     assertEquals(validJarPath, entity.getJarFilePath());
     assertEquals(validJarChecksum, entity.getJarChecksum());
     assertEquals("1.0.0", entity.getVersion());
     assertEquals("APPROVED", entity.getApprovalStatus());
-    assertEquals(LoadResult.UNLOADED, entity.getLoadStatus(), "the definition stays unloaded");
+    assertEquals(LoadResult.LOADED, entity.getLoadStatus(), "the load status is unchanged");
     assertTrue(Files.exists(Path.of(validJarPath)), "Current JAR must be kept");
     try (var files = Files.list(tempDir)) {
       assertEquals(1, files.count(), "No new JAR may be left behind");
     }
+    assertTrue(lifecycleLocksOf(service).isEmpty());
 
     AuditEvent replaced = singleReplacedAuditEvent();
     assertEquals(AuditEvent.FAILURE, replaced.outcome());
     assertTrue(replaced.details().contains("id=63"), replaced.details());
     assertTrue(replaced.details().contains("Main class not found"), replaced.details());
-    assertTrue(replaced.details().contains("stays unloaded"), replaced.details());
-    assertTrue(replaced.details().contains(validJarPath), replaced.details());
+    assertTrue(replaced.details().contains("Nothing was changed"), replaced.details());
+    assertTrue(replaced.details().contains("no new JAR was stored"), replaced.details());
+    assertFalse(replaced.details().contains("stays unloaded"), replaced.details());
   }
 
   @Test

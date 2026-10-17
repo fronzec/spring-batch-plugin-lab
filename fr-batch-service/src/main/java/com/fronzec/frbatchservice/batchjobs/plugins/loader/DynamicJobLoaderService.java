@@ -609,21 +609,24 @@ public class DynamicJobLoaderService {
    * Replaces the JAR of an existing job definition in place, keeping its ID so execution history
    * and parameter templates stay linked.
    *
-   * <p>The whole operation runs under the per-definition lifecycle lock. It first unloads the
-   * plugin without force, so running executions reject the replacement with {@link
-   * JobUnloadConflictException} and nothing changes. It then validates and stores the new JAR
-   * through {@link JarUploadService#storeReplacementJar} under a unique file name, so the current
-   * JAR is never overwritten. One database transaction updates the JAR path, checksum, version,
-   * and main class, resets the approval to {@code PENDING} (clearing the approver), and keeps the
-   * definition {@code UNLOADED}; {@code enabled} is unchanged. After commit, the previous JAR is
-   * deleted and then the non-production auto-approval is applied as on upload.
+   * <p>The whole operation runs under the per-definition lifecycle lock. It first validates and
+   * stores the new JAR through {@link JarUploadService#storeReplacementJar} under a unique file
+   * name, so the current JAR is never overwritten and a rejected JAR never touches the plugin.
+   * It then unloads the plugin without force, so running executions reject the replacement with
+   * {@link JobUnloadConflictException}; the new JAR is discarded and nothing else changes. One
+   * database transaction updates the JAR path, checksum, version, and main class, resets the
+   * approval to {@code PENDING} (clearing the approver), and keeps the definition {@code
+   * UNLOADED}; {@code enabled} is unchanged. After commit, the previous JAR is deleted and then
+   * the non-production auto-approval is applied as on upload.
    *
    * <p>A missing previous JAR is not an error. If it cannot be removed after commit, the
    * replacement still succeeds, a warning is logged, and the {@code JAR_REPLACED} success audit
    * names the orphan JAR path. Any failure before or at commit deletes the newly stored JAR (best
-   * effort), emits a {@code JAR_REPLACED} failure audit, and propagates the original exception;
-   * the definition keeps its previous JAR and metadata but stays unloaded when the failure
-   * happened after the unload.
+   * effort), emits a {@code JAR_REPLACED} failure audit, and propagates the original exception.
+   * A failure before the unload (an invalid JAR or running executions) changes nothing: the
+   * definition, its current JAR, and the plugin stay as they were, loaded if they were loaded.
+   * Only a failure after the unload (the database update) leaves the plugin unloaded; the
+   * definition still keeps its current JAR and metadata.
    *
    * @param definitionId the database ID of the job definition whose JAR is replaced
    * @param file the replacement JAR
@@ -631,10 +634,13 @@ public class DynamicJobLoaderService {
    * @param mainClassName fully-qualified class name of the {@code BatchJobPlugin} implementation
    * @return the updated definition
    * @throws NoSuchElementException if the definition does not exist
-   * @throws JobUnloadConflictException if the job has running executions; nothing is changed
-   * @throws InvalidJarException if the replacement JAR fails validation; the definition is kept
+   * @throws JobUnloadConflictException if the job has running executions; the new JAR is
+   *     discarded and nothing else is changed
+   * @throws InvalidJarException if the replacement JAR fails validation; nothing is changed and
+   *     the plugin stays as it was
    * @throws org.springframework.dao.DataAccessException if the database update fails; the
-   *     transaction is rolled back, the new JAR is deleted, and the previous JAR is kept
+   *     transaction is rolled back, the new JAR is deleted, the previous JAR is kept, and the
+   *     plugin stays unloaded
    */
   public JobDefinitionEntity replaceJar(
       Long definitionId, MultipartFile file, String version, String mainClassName) {
@@ -663,20 +669,21 @@ public class DynamicJobLoaderService {
     StoredJar storedJar = null;
     JobDefinitionEntity updated;
     try {
+      // Validate and store first so a rejected JAR never unloads a working plugin.
+      storedJar = jarUploadService.storeReplacementJar(file, jobName, version, mainClassName);
       doUnloadJob(definitionId, false);
       unloaded = true;
-      storedJar = jarUploadService.storeReplacementJar(file, jobName, version, mainClassName);
       StoredJar newJar = storedJar;
       updated =
           lifecycleTransaction.execute(
               status -> applyReplacement(definitionId, newJar, version, mainClassName));
     } catch (RuntimeException e) {
       String outcome;
+      String newJarOutcome =
+          storedJar == null ? "no new JAR was stored" : discardStoredJar(storedJar.path(), e);
       if (!unloaded) {
-        outcome = "Nothing was changed.";
+        outcome = "Nothing was changed; " + newJarOutcome + ".";
       } else {
-        String newJarOutcome =
-            storedJar == null ? "no new JAR was stored" : discardStoredJar(storedJar.path(), e);
         outcome =
             "The plugin was unloaded and stays unloaded; the definition and its current JAR "
                 + previousJarPath

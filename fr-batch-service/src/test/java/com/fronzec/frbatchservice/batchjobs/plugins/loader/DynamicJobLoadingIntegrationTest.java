@@ -646,11 +646,17 @@ class DynamicJobLoadingIntegrationTest {
         .andExpect(jsonPath("$.error").value("Not Found"));
   }
 
-  /* ── 18. Replace with an invalid JAR → 400, definition and JAR kept ───── */
+  /* ── 18. Replace with an invalid JAR → 400, definition, JAR, plugin kept ─ */
 
   @Test
   @Order(18)
-  void replaceJarWithInvalidJar_returnsBadRequest_andKeepsDefinitionAndJar() throws Exception {
+  void replaceJarWithInvalidJar_returnsBadRequest_andKeepsDefinitionJarAndLoadedPlugin()
+      throws Exception {
+    // Test 16 leaves the replacement approved and loaded; load it if that is not the case.
+    if (!pluginRegistryService.getRegisteredJobNames().contains(JOB_NAME)) {
+      loaderService.loadJob(definitionId);
+    }
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
     JobDefinitionEntity before = jobDefinitionRepository.findById(definitionId).orElseThrow();
     MockMultipartFile notAJar =
         new MockMultipartFile(
@@ -671,8 +677,9 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(after.getVersion()).isEqualTo(REPLACEMENT_VERSION);
     assertThat(after.getApprovalStatus()).isEqualTo("APPROVED");
     assertThat(Path.of(after.getJarFilePath())).exists();
-    // The replace unloads before validating, so a rejected JAR leaves the definition unloaded.
-    assertThat(pluginRegistryService.getRegisteredJobNames()).doesNotContain(JOB_NAME);
+    // The replace validates before unloading, so a rejected JAR leaves the plugin loaded.
+    assertThat(after.getLoadStatus()).isEqualTo(before.getLoadStatus());
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
   }
 
   /* ── 19. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */

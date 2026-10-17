@@ -305,16 +305,17 @@ public class JobManagementController {
      * {@link DynamicJobLoaderService#replaceJar}. The definition keeps its ID, so its
      * execution history and parameter templates stay linked.
      *
-     * <p>The plugin is unloaded first, the new JAR is validated like an upload and stored
-     * under a unique file name, and one transaction updates the JAR path, checksum,
+     * <p>The new JAR is first validated like an upload and stored under a unique file name,
+     * then the plugin is unloaded, and one transaction updates the JAR path, checksum,
      * version, and main class and resets the approval to {@code PENDING} (non-production
      * profiles re-apply auto-approval). The definition stays unloaded and must be approved
      * and loaded again. The previous JAR is deleted after commit.
      *
      * <p>Returns {@code 200 OK} with the updated definition, {@code 404 Not Found} if the
      * definition does not exist, {@code 409 Conflict} if the job has running executions
-     * (nothing is changed), and {@code 400 Bad Request} if the JAR fails validation (the
-     * definition keeps its JAR but stays unloaded).
+     * (the new JAR is discarded and nothing else is changed), and {@code 400 Bad Request}
+     * if the JAR fails validation (nothing is changed; the plugin stays loaded if it was
+     * loaded).
      *
      * @param id            the job definition ID
      * @param file          the replacement JAR
