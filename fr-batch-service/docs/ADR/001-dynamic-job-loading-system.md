@@ -1,29 +1,47 @@
 # ADR 001: Dynamic Job Loading System with Database-Driven Registry
 
 ## Status
+
 **Implemented (Phase 1-6)** — 2026-05-31. Original proposal: 2026-03-02.
 
-Phase 1 (Foundation), Phase 2 (Core Integration), Phase 3 (Dynamic Loading API Layer), Phase 4 (Dynamic Job Loading), Phase 5 (Security and Hardening), and Phase 6 (Example, Documentation, Health & Metrics) are complete. Phase 3 built the REST API, persistence, and JAR upload infrastructure for runtime job management — REST endpoints, Flyway migration, JPA entities, JAR validation, and global error handling. Phase 4 delivers the `DynamicJobClassLoader`, `DynamicJobLoaderService`, and load/unload/reload lifecycle. Phase 5 closes critical security gaps with Spring Security HTTP Basic auth, checksum re-verification at load, JAR signature verification, approval workflow, and audit logging. Phase 6 adds observability (health indicator, Micrometer metrics), a standalone example plugin project (`example-payment-job/`), updated developer docs, and a production readiness checklist. Phase 7 remains as future work.
+Phase 1 (Foundation), Phase 2 (Core Integration), Phase 3 (Dynamic Loading API Layer), Phase 4
+(Dynamic Job Loading), Phase 5 (Security and Hardening), and Phase 6 (Example, Documentation, Health
+& Metrics) are complete. Phase 3 built the REST API, persistence, and JAR upload infrastructure for
+runtime job management — REST endpoints, Flyway migration, JPA entities, JAR validation, and global
+error handling. Phase 4 delivers the `DynamicJobClassLoader`, `DynamicJobLoaderService`, and
+load/unload/reload lifecycle. Phase 5 closes critical security gaps with Spring Security HTTP Basic
+auth, checksum re-verification at load, JAR signature verification, approval workflow, and audit
+logging. Phase 6 adds observability (health indicator, Micrometer metrics), a standalone example
+plugin project (`example-payment-job/`), updated developer docs, and a production readiness
+checklist. Phase 7 remains as future work.
 
 See [Revised Approach](#revised-approach) below for the actual architecture.
 
 ## Context and Problem Statement
 
-The current fr-batch-service implementation has several limitations that hinder scalability and operational flexibility:
+The current fr-batch-service implementation has several limitations that hinder scalability and
+operational flexibility:
 
 ### Current Limitations
 
-1. **Hardcoded Job Registry**: Jobs are manually registered in `JobsManagerService.manualDefinedJobs` HashMap, requiring code changes and redeployment for new jobs
-2. **Monolithic Architecture**: All job logic resides in the same codebase, making it difficult for teams to work independently
-3. **No Version Management**: Cannot run multiple versions of the same job or roll back to previous versions
-4. **Tight Coupling**: Job implementations are tightly coupled to the core batch service
-5. **Limited Reusability**: Jobs cannot be shared across different batch service instances or environments
-6. **Manual Deployment**: Adding new jobs requires full application rebuild and deployment
+1. **Hardcoded Job Registry**: Jobs are manually registered in
+   `JobsManagerService.manualDefinedJobs` HashMap, requiring code changes and redeployment for new
+   jobs
+1. **Monolithic Architecture**: All job logic resides in the same codebase, making it difficult for
+   teams to work independently
+1. **No Version Management**: Cannot run multiple versions of the same job or roll back to previous
+   versions
+1. **Tight Coupling**: Job implementations are tightly coupled to the core batch service
+1. **Limited Reusability**: Jobs cannot be shared across different batch service instances or
+   environments
+1. **Manual Deployment**: Adding new jobs requires full application rebuild and deployment
 
 ### Business Drivers
 
-- **Faster Time-to-Market**: Business teams need to deploy new batch jobs without waiting for core platform releases
-- **Team Autonomy**: Multiple teams should be able to develop and deploy their own batch jobs independently
+- **Faster Time-to-Market**: Business teams need to deploy new batch jobs without waiting for core
+  platform releases
+- **Team Autonomy**: Multiple teams should be able to develop and deploy their own batch jobs
+  independently
 - **Flexibility**: Ability to enable/disable jobs dynamically based on business needs
 - **Operational Safety**: Ability to test jobs in isolation and roll back problematic versions
 - **Multi-tenancy**: Support for different job sets per environment or customer
@@ -33,10 +51,10 @@ The current fr-batch-service implementation has several limitations that hinder 
 We will implement a **Plugin-Based Dynamic Job Loading System** that allows batch jobs to be:
 
 1. Developed as separate, independent Maven/Gradle projects
-2. Packaged as executable JAR files
-3. Uploaded and registered dynamically at runtime
-4. Stored and managed through a database registry
-5. Loaded, unloaded, and reloaded without service restart
+1. Packaged as executable JAR files
+1. Uploaded and registered dynamically at runtime
+1. Stored and managed through a database registry
+1. Loaded, unloaded, and reloaded without service restart
 
 ### Key Components
 
@@ -111,9 +129,13 @@ We will implement a **Plugin-Based Dynamic Job Loading System** that allows batc
 
 ## Revised Approach (Implemented)
 
-The original proposal envisioned **dynamic JAR loading with classloader isolation** — jobs packaged as external JARs, uploaded at runtime, loaded by a custom `DynamicJobClassLoader`, and registered into a database-driven registry. That approach remains the long-term vision (Phases 3-7).
+The original proposal envisioned **dynamic JAR loading with classloader isolation** — jobs packaged
+as external JARs, uploaded at runtime, loaded by a custom `DynamicJobClassLoader`, and registered
+into a database-driven registry. That approach remains the long-term vision (Phases 3-7).
 
-**What was actually built** is a pragmatic first step: a **classpath-based plugin registry** that solves the immediate problem — eliminating the hardcoded job map in `JobsManagerService` — without introducing classloader complexity.
+**What was actually built** is a pragmatic first step: a **classpath-based plugin registry** that
+solves the immediate problem — eliminating the hardcoded job map in `JobsManagerService` — without
+introducing classloader complexity.
 
 ### Actual Architecture (Phase 1-2)
 
@@ -160,49 +182,70 @@ The original proposal envisioned **dynamic JAR loading with classloader isolatio
 
 ### Key Differences from Original Proposal
 
-| Aspect | Original ADR | Actual Implementation |
-|---|---|---|
-| Plugin discovery | Dynamic JAR scan + SPI | Spring bean injection (`List<BatchJobPlugin>`) |
-| Class loading | Custom `DynamicJobClassLoader` per JAR | Shared classpath (no isolation) |
-| Registration | Database-driven + REST upload API | In-memory `MapJobRegistry` at startup |
-| Hot reload | Unload → reload cycle | Requires app restart |
-| Plugin location | External JAR in `/var/batch-jobs/` | Same codebase (`@Component` in `fr-batch-service`) |
-| Version management | Multiple versions coexist | One version per deployment |
-| Complexity | Very high (classloader, memory mgmt, SPI) | Low (plain Spring beans) |
+| Aspect             | Original ADR                              | Actual Implementation                              |
+| ------------------ | ----------------------------------------- | -------------------------------------------------- |
+| Plugin discovery   | Dynamic JAR scan + SPI                    | Spring bean injection (`List<BatchJobPlugin>`)     |
+| Class loading      | Custom `DynamicJobClassLoader` per JAR    | Shared classpath (no isolation)                    |
+| Registration       | Database-driven + REST upload API         | In-memory `MapJobRegistry` at startup              |
+| Hot reload         | Unload → reload cycle                     | Requires app restart                               |
+| Plugin location    | External JAR in `/var/batch-jobs/`        | Same codebase (`@Component` in `fr-batch-service`) |
+| Version management | Multiple versions coexist                 | One version per deployment                         |
+| Complexity         | Very high (classloader, memory mgmt, SPI) | Low (plain Spring beans)                           |
 
 ### Why This Approach First
 
-1. **Solves the immediate problem**: `JobsManagerService` no longer has a hardcoded job map. Adding a new job means creating a `@Component` that implements `BatchJobPlugin` — no other code changes.
-2. **Zero operational risk**: No classloader leaks, no JAR validation, no upload security surface. Plain Spring beans behave exactly like the rest of the application.
-3. **Progressive complexity**: The `PluginRegistryService` contract (`getPlugins()`, `getPlugin(name)`) is the same abstraction a future dynamic loader would populate. Swap the backend, keep the API.
-4. **Testable today**: Integration tests can `@Autowired List<BatchJobPlugin>` and verify the full pipeline end-to-end with `ExitStatus.COMPLETED`.
+1. **Solves the immediate problem**: `JobsManagerService` no longer has a hardcoded job map. Adding
+   a new job means creating a `@Component` that implements `BatchJobPlugin` — no other code changes.
+1. **Zero operational risk**: No classloader leaks, no JAR validation, no upload security surface.
+   Plain Spring beans behave exactly like the rest of the application.
+1. **Progressive complexity**: The `PluginRegistryService` contract (`getPlugins()`,
+   `getPlugin(name)`) is the same abstraction a future dynamic loader would populate. Swap the
+   backend, keep the API.
+1. **Testable today**: Integration tests can `@Autowired List<BatchJobPlugin>` and verify the full
+   pipeline end-to-end with `ExitStatus.COMPLETED`.
 
 ### ADR Decisions Made During Implementation
 
 **ADR-I1: Classpath-based discovery over dynamic JAR loading for Phase 2**
 
-- **Decision**: Use Spring's existing bean injection (`List<BatchJobPlugin>`) instead of custom classloaders.
-- **Rationale**: The business need is removing the hardcoded job map, not runtime JAR upload. Dynamic classloading adds 10x complexity for a feature (hot reload) that has no production demand yet. The plugin contract is the same either way — when dynamic loading is needed, the registry service API stays stable.
-- **Trade-off**: Plugins live in the same codebase and classpath. True team isolation (separate repos, independent deploy) is deferred.
-- **Rejected**: Building the full `DynamicJobClassLoader` infrastructure now, which would have delayed the plugin migration by weeks and introduced memory-leak risk before the basic contract was validated.
+- **Decision**: Use Spring's existing bean injection (`List<BatchJobPlugin>`) instead of custom
+  classloaders.
+- **Rationale**: The business need is removing the hardcoded job map, not runtime JAR upload.
+  Dynamic classloading adds 10x complexity for a feature (hot reload) that has no production demand
+  yet. The plugin contract is the same either way — when dynamic loading is needed, the registry
+  service API stays stable.
+- **Trade-off**: Plugins live in the same codebase and classpath. True team isolation (separate
+  repos, independent deploy) is deferred.
+- **Rejected**: Building the full `DynamicJobClassLoader` infrastructure now, which would have
+  delayed the plugin migration by weeks and introduced memory-leak risk before the basic contract
+  was validated.
 
 **ADR-I2: @MockitoBean over @MockBean for Spring Boot 4.0.0**
 
-- **Decision**: Use `org.springframework.test.context.bean.override.mockito.MockitoBean` for test mocking.
-- **Rationale**: Spring Boot 4.0.0 / Spring Framework 7.x relocated the mock annotation. `@MockBean` still exists but `@MockitoBean` is the forward-looking choice for the version this project targets.
+- **Decision**: Use `org.springframework.test.context.bean.override.mockito.MockitoBean` for test
+  mocking.
+- **Rationale**: Spring Boot 4.0.0 / Spring Framework 7.x relocated the mock annotation. `@MockBean`
+  still exists but `@MockitoBean` is the forward-looking choice for the version this project
+  targets.
 - **Rejected**: `@MockBean` (deprecated path).
 
 **ADR-I3: Assert on Map.get("result") instead of unwrapping JobExecution**
 
-- **Decision**: The integration test assertion reads `result.get("result")` from `JobsManagerService.syncRunJobWithParams()` return map, not a direct `JobExecution` reference.
-- **Rationale**: The map IS the public contract of the service. Adding a `JobExecutionListener` or `JobRepository` query to the test expands surface area for no extra signal.
-- **Rejected**: Injecting `JobRepository` and querying execution history (brittle ordering), or adding test-only scaffolding.
+- **Decision**: The integration test assertion reads `result.get("result")` from
+  `JobsManagerService.syncRunJobWithParams()` return map, not a direct `JobExecution` reference.
+- **Rationale**: The map IS the public contract of the service. Adding a `JobExecutionListener` or
+  `JobRepository` query to the test expands surface area for no extra signal.
+- **Rejected**: Injecting `JobRepository` and querying execution history (brittle ordering), or
+  adding test-only scaffolding.
 
 **ADR-I4: 3-row CSV fixture over 1000 rows**
 
 - **Decision**: The test CSV `sample-persons-1k.csv` contains 3 rows despite the filename.
-- **Rationale**: The filename is a hardcoded artifact in `CsvReader`. Changing it would require a production code change (out of scope). 3 rows exercise chunk processing without bloating CI runtime. The name does not need to match the size.
-- **Rejected**: Generating 1000 rows (slower CI, no extra coverage) or refactoring `CsvReader` to accept a configurable path (production change out of scope).
+- **Rationale**: The filename is a hardcoded artifact in `CsvReader`. Changing it would require a
+  production code change (out of scope). 3 rows exercise chunk processing without bloating CI
+  runtime. The name does not need to match the size.
+- **Rejected**: Generating 1000 rows (slower CI, no extra coverage) or refactoring `CsvReader` to
+  accept a configurable path (production change out of scope).
 
 ## Technical Architecture
 
@@ -322,6 +365,7 @@ Job JAR Classes
 ```
 
 **Key Features:**
+
 - Each job gets its own `URLClassLoader` instance
 - Jobs can use different versions of libraries
 - Spring core classes loaded from parent to share infrastructure
@@ -704,6 +748,7 @@ public class JobManagementController {
 ### 6. Example Job Plugin Project
 
 **Project Structure:**
+
 ```
 example-payment-job/
 ├── pom.xml
@@ -724,6 +769,7 @@ example-payment-job/
 ```
 
 **pom.xml:**
+
 ```xml
 <dependencies>
     <!-- Job Plugin API -->
@@ -777,6 +823,7 @@ example-payment-job/
 ```
 
 **PaymentJobPlugin.java:**
+
 ```java
 package com.example.payment;
 
@@ -879,6 +926,7 @@ public class PaymentJobPlugin implements BatchJobPlugin {
 ```
 
 **META-INF/services/com.fronzec.api.BatchJobPlugin:**
+
 ```
 com.example.payment.PaymentJobPlugin
 ```
@@ -886,6 +934,7 @@ com.example.payment.PaymentJobPlugin
 ### 7. Integration with Existing JobsManagerService
 
 **Refactor approach:**
+
 ```java
 @Service
 public class JobsManagerService {
@@ -922,51 +971,51 @@ public class JobsManagerService {
 ### Positive
 
 1. **Agility**: Teams can develop and deploy jobs independently
-2. **Isolation**: Job failures don't affect other jobs or core platform
-3. **Versioning**: Multiple versions can coexist, easy rollback
-4. **Scalability**: Core platform doesn't grow with every new job
-5. **Flexibility**: Enable/disable jobs without deployment
-6. **Testability**: Jobs can be tested in isolation
-7. **Reusability**: Jobs can be shared across environments
-8. **Auditability**: Complete history of job deployments in database
+1. **Isolation**: Job failures don't affect other jobs or core platform
+1. **Versioning**: Multiple versions can coexist, easy rollback
+1. **Scalability**: Core platform doesn't grow with every new job
+1. **Flexibility**: Enable/disable jobs without deployment
+1. **Testability**: Jobs can be tested in isolation
+1. **Reusability**: Jobs can be shared across environments
+1. **Auditability**: Complete history of job deployments in database
 
 ### Negative
 
 1. **Complexity**: Significant increase in system complexity
-2. **Memory Management**: Risk of memory leaks from classloaders
-3. **Debugging Difficulty**: Harder to debug across classloader boundaries
-4. **Transaction Boundaries**: Care needed with transaction management across classloaders
-5. **Classpath Conflicts**: Potential for subtle bugs due to library version conflicts
-6. **Performance Overhead**: Classloader delegation adds minor overhead
-7. **Operational Burden**: Need to manage JAR storage, versioning, cleanup
-8. **Security Risks**: Uploaded JARs could contain malicious code
+1. **Memory Management**: Risk of memory leaks from classloaders
+1. **Debugging Difficulty**: Harder to debug across classloader boundaries
+1. **Transaction Boundaries**: Care needed with transaction management across classloaders
+1. **Classpath Conflicts**: Potential for subtle bugs due to library version conflicts
+1. **Performance Overhead**: Classloader delegation adds minor overhead
+1. **Operational Burden**: Need to manage JAR storage, versioning, cleanup
+1. **Security Risks**: Uploaded JARs could contain malicious code
 
 ### Risks and Mitigations
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| Memory leaks from classloaders | High | High | Implement proper cleanup, monitoring, automated tests |
-| Malicious JAR uploads | Medium | Critical | JAR signing, checksum validation, sandboxing, approval workflow |
-| Version conflicts | Medium | Medium | Isolated classloaders, dependency documentation |
-| Performance degradation | Low | Medium | Benchmarking, lazy loading, caching |
-| Job incompatibility after platform upgrade | Medium | High | Versioned API, compatibility testing, deprecation policy |
-| Database corruption | Low | Critical | Regular backups, transaction management, validation |
-| Storage exhaustion | Medium | Medium | Quota limits, cleanup policies, monitoring |
+| Risk                                       | Likelihood | Impact   | Mitigation                                                      |
+| ------------------------------------------ | ---------- | -------- | --------------------------------------------------------------- |
+| Memory leaks from classloaders             | High       | High     | Implement proper cleanup, monitoring, automated tests           |
+| Malicious JAR uploads                      | Medium     | Critical | JAR signing, checksum validation, sandboxing, approval workflow |
+| Version conflicts                          | Medium     | Medium   | Isolated classloaders, dependency documentation                 |
+| Performance degradation                    | Low        | Medium   | Benchmarking, lazy loading, caching                             |
+| Job incompatibility after platform upgrade | Medium     | High     | Versioned API, compatibility testing, deprecation policy        |
+| Database corruption                        | Low        | Critical | Regular backups, transaction management, validation             |
+| Storage exhaustion                         | Medium     | Medium   | Quota limits, cleanup policies, monitoring                      |
 
 ### Trade-offs
 
 **Chosen Approach vs. Alternatives:**
 
-| Aspect | Dynamic Loading | Microservices | Script-Based |
-|--------|----------------|---------------|--------------|
-| Complexity | Medium | High | Low |
-| Isolation | Medium | High | Low |
-| Performance | Good | Medium (network) | Good |
-| Resource Usage | Medium | High | Low |
-| Development Effort | High | Very High | Low |
-| Operational Overhead | Medium | High | Low |
-| Security | Medium | High | Low |
-| Spring Integration | Excellent | Medium | Medium |
+| Aspect               | Dynamic Loading | Microservices    | Script-Based |
+| -------------------- | --------------- | ---------------- | ------------ |
+| Complexity           | Medium          | High             | Low          |
+| Isolation            | Medium          | High             | Low          |
+| Performance          | Good            | Medium (network) | Good         |
+| Resource Usage       | Medium          | High             | Low          |
+| Development Effort   | High            | Very High        | Low          |
+| Operational Overhead | Medium          | High             | Low          |
+| Security             | Medium          | High             | Low          |
+| Spring Integration   | Excellent       | Medium           | Medium       |
 
 ## Alternatives Considered
 
@@ -975,12 +1024,14 @@ public class JobsManagerService {
 **Description:** Each job as a separate Spring Boot microservice with REST API
 
 **Pros:**
+
 - Complete isolation (separate processes)
 - Independent scaling
 - Technology heterogeneity
 - Standard deployment patterns
 
 **Cons:**
+
 - Much higher resource usage (JVM per job)
 - Network latency for orchestration
 - Complex service discovery and coordination
@@ -994,12 +1045,14 @@ public class JobsManagerService {
 **Description:** Store job logic as scripts in database, execute via scripting engine
 
 **Pros:**
+
 - Maximum flexibility
 - No JAR packaging needed
 - Easy to modify jobs
 - Low complexity
 
 **Cons:**
+
 - Security nightmare (arbitrary code execution)
 - Poor performance compared to compiled code
 - Difficult to test and debug
@@ -1013,12 +1066,14 @@ public class JobsManagerService {
 **Description:** Compile each job to native binary, execute as separate process
 
 **Pros:**
+
 - Best isolation
 - Fast startup
 - Low memory footprint
 - No classloader issues
 
 **Cons:**
+
 - Limited Spring Batch support in native mode
 - Long compilation times
 - Reflection configuration complexity
@@ -1032,12 +1087,14 @@ public class JobsManagerService {
 **Description:** Continue with monolithic jobs in single codebase
 
 **Pros:**
+
 - Simple to understand
 - No additional complexity
 - Easy debugging
 - Good IDE support
 
 **Cons:**
+
 - Cannot add jobs without redeployment
 - Tight coupling
 - No version management
@@ -1048,94 +1105,198 @@ public class JobsManagerService {
 ## Implementation Plan
 
 ### Phase 1: Foundation ✅ COMPLETE (May 2026)
+
 - [x] Create `batch-job-api` module with plugin interfaces
-- [x] Design database schema (Flyway removed; schema lives in test resources and external migrations)
+- [x] Design database schema (Flyway removed; schema lives in test resources and external
+  migrations)
 - [x] Set up artifact repository for API module (GitHub Packages)
 - [x] Create documentation for job plugin development (`docs/job-plugins/developer-guide.md`)
 
-**Implemented:** `batch-job-api` published to GitHub Packages as `com.fronzec:batch-job-api:0.0.1-SNAPSHOT`. Developer guide written. Flyway migrations exist in `migrations/` but are externalized from the main build — see commit `e675bb9`.
+**Implemented:** `batch-job-api` published to GitHub Packages as
+`com.fronzec:batch-job-api:0.0.1-SNAPSHOT`. Developer guide written. Flyway migrations exist in
+`migrations/` but are externalized from the main build — see commit `e675bb9`.
 
 ### Phase 2: Core Integration ✅ COMPLETE (May 2026) — REVISED SCOPE
-- [x] Implement `PluginRegistryService` (classpath-based bean discovery, MapJobRegistry registration)
+
+- [x] Implement `PluginRegistryService` (classpath-based bean discovery, MapJobRegistry
+  registration)
 - [x] Migrate `job1` from hardcoded `@Bean Job` to `Job1Plugin` implementing `BatchJobPlugin`
-- [x] Refactor `JobsManagerService` to delegate discovery to plugin registry (remove `manualDefinedJobs`)
+- [x] Refactor `JobsManagerService` to delegate discovery to plugin registry (remove
+  `manualDefinedJobs`)
 - [x] Add `PluginRegistrationException` for fail-fast duplicate/null/name-mismatch detection
-- [x] Expose `GET /jobs/plugins` endpoint with plugin metadata (`PluginController`, `PluginInfoResponse`)
+- [x] Expose `GET /jobs/plugins` endpoint with plugin metadata (`PluginController`,
+  `PluginInfoResponse`)
 - [x] Add unit tests (`PluginRegistryServiceTest`, updated `JobsManagerServiceTest`)
 - [x] Add integration test (`PluginArchitectureIntegrationTest`) with full ETL pipeline assertion
 - [x] Fix H2 2.4.x dialect bug in `Step3Reader` (parameterized `IS ?` → literal `IS NULL`)
 
 **Deferred from original scope:**
+
 - [ ] `DynamicJobClassLoader` (deferred — no production demand for runtime JAR loading yet)
 - [ ] `ClassLoaderManager` (deferred)
 - [ ] `DynamicJobLoaderService` with JAR upload (deferred — replaced by `PluginRegistryService`)
 - [ ] JPA entities and repositories for job registry (deferred)
 
-**Deliverables:** Plugin registry functional with 5/5 integration tests passing. Any `@Component` implementing `BatchJobPlugin` is auto-discovered at startup. `Job1Plugin` runs 3-step ETL pipeline to `ExitStatus.COMPLETED` in integration tests. See PRs #27, #28, #29.
+**Deliverables:** Plugin registry functional with 5/5 integration tests passing. Any `@Component`
+implementing `BatchJobPlugin` is auto-discovered at startup. `Job1Plugin` runs 3-step ETL pipeline
+to `ExitStatus.COMPLETED` in integration tests. See PRs #27, #28, #29.
 
 ### Phase 3: Dynamic Loading API Layer ✅ COMPLETE (May 2026)
-- [x] Flyway enabled + `V1__job_registry_tables.sql` migration (3 tables: `job_definitions`, `job_parameters_template`, `job_executions_audit`)
-- [x] 3 JPA entities + 3 Spring Data JPA repositories (getter/setter style matching `PersonsEntity` conventions)
-- [x] `JarUploadService` with JAR extension validation + ZIP magic bytes (`PK\x03\x04`), SHA-256 checksum, path traversal protection, duplicate job-name detection via `JobDefinitionRepository.findByJobName()`
-- [x] `JobManagementController` with 6 endpoints: `POST /jobs/upload`, `GET /jobs/definitions`, `GET /jobs/definitions/{id}`, `PUT /jobs/definitions/{id}/enable`, `PUT /jobs/definitions/{id}/disable`, `DELETE /jobs/definitions/{id}`
-- [x] `PluginRegistryService` extended with `registerDynamicPlugin()` / `unregisterDynamicPlugin()` — thread-safe via `synchronized(pluginsByJobName)` block, stores `classLoaderRef` for Phase 4
-- [x] `MergedPluginInfoResponse` with `PluginSource` (`CLASSPATH`|`UPLOADED`) and `PluginStatus` (`ACTIVE`|`LOADED`|`ENABLED`|`DISABLED`) enums — merged plugin listing from both classpath + DB sources
-- [x] `GlobalExceptionHandler` (`@ControllerAdvice`) with 6 handlers: `InvalidJarException`→400, `DuplicateJobDefinitionException`→409, `NoSuchElementException`→404, `MethodArgumentNotValidException`→400, `MaxUploadSizeExceededException`→413, `Exception`→500
-- [x] `PluginManagementIntegrationTest` with 11 tests covering upload, CRUD, error handling, enable/disable, merged plugin listing, max-size validation
+
+- [x] Flyway enabled + `V1__job_registry_tables.sql` migration (3 tables: `job_definitions`,
+  `job_parameters_template`, `job_executions_audit`)
+- [x] 3 JPA entities + 3 Spring Data JPA repositories (getter/setter style matching `PersonsEntity`
+  conventions)
+- [x] `JarUploadService` with JAR extension validation + ZIP magic bytes (`PK\x03\x04`), SHA-256
+  checksum, path traversal protection, duplicate job-name detection via
+  `JobDefinitionRepository.findByJobName()`
+- [x] `JobManagementController` with 6 endpoints: `POST /jobs/upload`, `GET /jobs/definitions`,
+  `GET /jobs/definitions/{id}`, `PUT /jobs/definitions/{id}/enable`,
+  `PUT /jobs/definitions/{id}/disable`, `DELETE /jobs/definitions/{id}`
+- [x] `PluginRegistryService` extended with `registerDynamicPlugin()` / `unregisterDynamicPlugin()`
+  — thread-safe via `synchronized(pluginsByJobName)` block, stores `classLoaderRef` for Phase 4
+- [x] `MergedPluginInfoResponse` with `PluginSource` (`CLASSPATH`|`UPLOADED`) and `PluginStatus`
+  (`ACTIVE`|`LOADED`|`ENABLED`|`DISABLED`) enums — merged plugin listing from both classpath + DB
+  sources
+- [x] `GlobalExceptionHandler` (`@ControllerAdvice`) with 6 handlers: `InvalidJarException`→400,
+  `DuplicateJobDefinitionException`→409, `NoSuchElementException`→404,
+  `MethodArgumentNotValidException`→400, `MaxUploadSizeExceededException`→413, `Exception`→500
+- [x] `PluginManagementIntegrationTest` with 11 tests covering upload, CRUD, error handling,
+  enable/disable, merged plugin listing, max-size validation
 - [x] All 42 tests passing (31 existing + 11 new), `mvn test` BUILD SUCCESS
 
 **Deferred from Phase 3 (resolved):**
+
 - [x] `DynamicJobClassLoader` — implemented in Phase 4 (PR #35)
 - [x] `POST /jobs/definitions/{id}/reload` — implemented in Phase 4 (PR #37)
 - [x] JAR signature verification — implemented in Phase 5 (PR #42)
 
-**Deliverables:** REST API layer for runtime job management fully operational. JAR upload (SHA-256 checksum, validation), CRUD operations, enable/disable toggle, and consistent error handling all production-ready. The `PluginController.getPlugins()` endpoint now merges classpath plugins with DB-registered definitions (`MergedPluginInfoResponse`), providing visibility into both worlds. 4 PRs merged via stacked-to-main chain (PR #30 → #32 → #33 → #34), 35/35 tasks complete, 42/42 tests passing.
+**Deliverables:** REST API layer for runtime job management fully operational. JAR upload (SHA-256
+checksum, validation), CRUD operations, enable/disable toggle, and consistent error handling all
+production-ready. The `PluginController.getPlugins()` endpoint now merges classpath plugins with
+DB-registered definitions (`MergedPluginInfoResponse`), providing visibility into both worlds. 4 PRs
+merged via stacked-to-main chain (PR #30 → #32 → #33 → #34), 35/35 tasks complete, 42/42 tests
+passing.
 
 ### Phase 4: Dynamic Job Loading ✅ COMPLETE (May 2026)
-- [x] `DynamicJobClassLoader` — parent-last `URLClassLoader` with shared-package delegation (`org.springframework.*`, `jakarta.*`, `org.slf4j.*`, `com.fronzec.api.*`); `cleanup()` for resource release
-- [x] `DynamicJobLoaderService` — orchestrates load/unload/reload lifecycle; validates JAR checksum, creates classloader, loads `BatchJobPlugin` via `mainClassName`, registers via `PluginRegistryService.registerDynamicPlugin()`, tracks `loadStatus` transitions in DB
+
+- [x] `DynamicJobClassLoader` — parent-last `URLClassLoader` with shared-package delegation
+  (`org.springframework.*`, `jakarta.*`, `org.slf4j.*`, `com.fronzec.api.*`); `cleanup()` for
+  resource release
+- [x] `DynamicJobLoaderService` — orchestrates load/unload/reload lifecycle; validates JAR checksum,
+  creates classloader, loads `BatchJobPlugin` via `mainClassName`, registers via
+  `PluginRegistryService.registerDynamicPlugin()`, tracks `loadStatus` transitions in DB
 - [x] `POST /jobs/definitions/{id}/load` — load plugin from uploaded JAR; returns 200/404/409/400
-- [x] `POST /jobs/definitions/{id}/unload` — unload and close classloader; `?force=true` stops running executions first; returns 200/404/409
+- [x] `POST /jobs/definitions/{id}/unload` — unload and close classloader; `?force=true` stops
+  running executions first; returns 200/404/409
 - [x] `POST /jobs/definitions/{id}/reload` — atomic unload+load cycle
 - [x] `POST /jobs/load-all` — bulk load all enabled/unloaded definitions
-- [x] `PluginAutoLoader` (ApplicationRunner) — auto-load `enabled=true` definitions at startup; failures logged, do not block startup
-- [x] 11 E2E integration tests (`DynamicJobLoadingIntegrationTest`) covering full lifecycle: upload→enable→load→unload→reload→execute→loadAll
-- [x] Backward compatibility verified — all 69 pre-Phase-4 tests pass unchanged; classpath `Job1Plugin` continues working
+- [x] `PluginAutoLoader` (ApplicationRunner) — auto-load `enabled=true` definitions at startup;
+  failures logged, do not block startup
+- [x] 11 E2E integration tests (`DynamicJobLoadingIntegrationTest`) covering full lifecycle:
+  upload→enable→load→unload→reload→execute→loadAll
+- [x] Backward compatibility verified — all 69 pre-Phase-4 tests pass unchanged; classpath
+  `Job1Plugin` continues working
 
 **Deferred from Phase 4:**
+
 - [x] Health checks for loaded jobs — ✅ COMPLETE (Phase 6, PR #44)
 - [x] Metrics and monitoring (Micrometer instrumentation) — ✅ COMPLETE (Phase 6, PR #44)
 - [ ] Performance testing — Phase 7
 
-**Deliverables:** Dynamic job loading fully operational. Uploaded JARs can be loaded, executed, and unloaded without service restart. `DynamicJobClassLoader` provides classloader isolation with shared-package delegation. `DynamicJobLoaderService` owns the lifecycle with thread-safe `ConcurrentHashMap` tracking. `PluginAutoLoader` restores loaded plugins after restart. 4 PRs merged via stacked-to-main chain (PR #35 → #36 → #37 → #38), 26/26 tasks complete, 80/80 tests passing.
+**Deliverables:** Dynamic job loading fully operational. Uploaded JARs can be loaded, executed, and
+unloaded without service restart. `DynamicJobClassLoader` provides classloader isolation with
+shared-package delegation. `DynamicJobLoaderService` owns the lifecycle with thread-safe
+`ConcurrentHashMap` tracking. `PluginAutoLoader` restores loaded plugins after restart. 4 PRs merged
+via stacked-to-main chain (PR #35 → #36 → #37 → #38), 26/26 tasks complete, 80/80 tests passing.
 
-**Bug discovered:** `JdbcJobExecutionDao.findRunningJobExecutions()` in Spring Batch 6.0.0 throws `EmptyResultDataAccessException` when `JOB_EXECUTION` records exist but none have running status — the method uses `queryForObject` with a single-row `ResultSetExtractor`, which throws on empty results. Fixed in `DynamicJobLoaderService.unloadJob()` with try-catch guard. See commit `6120f87`.
+**Bug discovered:** `JdbcJobExecutionDao.findRunningJobExecutions()` in Spring Batch 6.0.0 throws
+`EmptyResultDataAccessException` when `JOB_EXECUTION` records exist but none have running status —
+the method uses `queryForObject` with a single-row `ResultSetExtractor`, which throws on empty
+results. Fixed in `DynamicJobLoaderService.unloadJob()` with try-catch guard. See commit `6120f87`.
 
 ### Phase 5: Security and Hardening ✅ COMPLETE (May 2026)
-- [x] **ChecksumUtil** — Extracted SHA-256 computation from `JarUploadService` into reusable static utility with `File`, `Path`, and `MultipartFile` overloads; added checksum re-verification at load time in `DynamicJobLoaderService` (mismatch → `loadStatus=FAILED`, `loadError="Checksum mismatch"`)
-- [x] **Spring Security baseline** — Added `spring-boot-starter-security`; `SecurityConfig` with HTTP Basic auth, role-based access (`PLUGIN_ADMIN` = all endpoints, `PLUGIN_VIEWER` = GET only), CSRF disabled; in-memory users via `SecurityProperties`; `GlobalExceptionHandler` for 401/403; security disabled in `test` profile via `@Profile("!test")`; all 88+ existing tests pass unchanged
-- [x] **Approval workflow** — `V2__add_approval_fields.sql` Flyway migration adding `approval_status`, `approved_by`, `approved_at` columns; `PUT /jobs/definitions/{id}/approve` and `/reject` endpoints; approval guard in `DynamicJobLoaderService.loadJob()` (`APPROVED` check → 409 if not approved); `AutoApproveConfig` (dev profile); integration test coverage
-- [x] **JAR signature verification** — `JarSignatureVerifier` using `java.util.jar.JarFile` with strict/permissive modes (`app.plugins.signature.mode`); strict rejects unsigned JARs, permissive logs WARN and continues; `SignatureResult` record; wired into `JarUploadService.uploadJar()`; 10 unit tests
-- [x] **Audit service + JobExecutionListener** — `AuditEventType` enum (8 lifecycle events), `AuditEvent` record, `AuditService` with SLF4J structured JSON logging + MDC correlation IDs; `JobExecutionAuditListener` populates `job_executions_audit` on job start/end; `createdBy` populated via `SecurityContext` resolver with `"system"` fallback; wired into `JarUploadService`, `DynamicJobLoaderService`, `JobManagementController`
-- [x] **8 Snyk CVEs resolved** — `spring-boot-starter-security` fixed `CVE-2024-38807` (DoS in Webflux token validation), `CVE-2024-38811` (OIDC session fixation), `CVE-2024-38813` (H2 Console XSS), `CVE-2024-38814` (OAuth2 client state parameter), `CVE-2024-38816` (Spring Web resource directory traversal), `CVE-2024-38819` (Reactive `WebClient` memory leak), `CVE-2024-38821` (Spring WebFlux `@RequestBody` validation bypass), and `CVE-2024-38825` (SSRF via `RestTemplate`/`WebClient`)
+
+- [x] **ChecksumUtil** — Extracted SHA-256 computation from `JarUploadService` into reusable static
+  utility with `File`, `Path`, and `MultipartFile` overloads; added checksum re-verification at load
+  time in `DynamicJobLoaderService` (mismatch → `loadStatus=FAILED`,
+  `loadError="Checksum mismatch"`)
+- [x] **Spring Security baseline** — Added `spring-boot-starter-security`; `SecurityConfig` with
+  HTTP Basic auth, role-based access (`PLUGIN_ADMIN` = all endpoints, `PLUGIN_VIEWER` = GET only),
+  CSRF disabled; in-memory users via `SecurityProperties`; `GlobalExceptionHandler` for 401/403;
+  security disabled in `test` profile via `@Profile("!test")`; all 88+ existing tests pass unchanged
+- [x] **Approval workflow** — `V2__add_approval_fields.sql` Flyway migration adding
+  `approval_status`, `approved_by`, `approved_at` columns; `PUT /jobs/definitions/{id}/approve` and
+  `/reject` endpoints; approval guard in `DynamicJobLoaderService.loadJob()` (`APPROVED` check → 409
+  if not approved); `AutoApproveConfig` (dev profile); integration test coverage
+- [x] **JAR signature verification** — `JarSignatureVerifier` using `java.util.jar.JarFile` with
+  strict/permissive modes (`app.plugins.signature.mode`); strict rejects unsigned JARs, permissive
+  logs WARN and continues; `SignatureResult` record; wired into `JarUploadService.uploadJar()`; 10
+  unit tests
+- [x] **Audit service + JobExecutionListener** — `AuditEventType` enum (8 lifecycle events),
+  `AuditEvent` record, `AuditService` with SLF4J structured JSON logging + MDC correlation IDs;
+  `JobExecutionAuditListener` populates `job_executions_audit` on job start/end; `createdBy`
+  populated via `SecurityContext` resolver with `"system"` fallback; wired into `JarUploadService`,
+  `DynamicJobLoaderService`, `JobManagementController`
+- [x] **8 Snyk CVEs resolved** — `spring-boot-starter-security` fixed `CVE-2024-38807` (DoS in
+  Webflux token validation), `CVE-2024-38811` (OIDC session fixation), `CVE-2024-38813` (H2 Console
+  XSS), `CVE-2024-38814` (OAuth2 client state parameter), `CVE-2024-38816` (Spring Web resource
+  directory traversal), `CVE-2024-38819` (Reactive `WebClient` memory leak), `CVE-2024-38821`
+  (Spring WebFlux `@RequestBody` validation bypass), and `CVE-2024-38825` (SSRF via
+  `RestTemplate`/`WebClient`)
 - [x] **99/99 tests passing**, `mvn test` BUILD SUCCESS
 
-**Implementation details**: Layered defense-in-depth — transport auth (HTTP Basic) → integrity (checksum re-verify + JAR signature) → authorization (approval guard). Each layer fails closed. All 5 PRs stacked on `plugin-architecture-phase-5` branch and merged to `plugin-architecture` via stacked-to-main chain. This completes Phase 5. See PRs #39, #40, #41, #42, #43.
+**Implementation details**: Layered defense-in-depth — transport auth (HTTP Basic) → integrity
+(checksum re-verify + JAR signature) → authorization (approval guard). Each layer fails closed. All
+5 PRs stacked on `plugin-architecture-phase-5` branch and merged to `plugin-architecture` via
+stacked-to-main chain. This completes Phase 5. See PRs #39, #40, #41, #42, #43.
 
 ### Phase 6: Example, Documentation, Health & Metrics ✅ COMPLETE (May 2026)
-- [x] **PluginHealthIndicator** — `@Component` implementing `HealthIndicator`; queries `PluginRegistryService.getPlugins().size()`, `JobDefinitionRepository.countByLoadStatus("FAILED")`, `Path.of(jarDir).toFile().canRead()`; returns DOWN if failed > 0 or dir inaccessible; exposed at `/actuator/health/plugins` via `management.endpoint.health.group.plugins.include=pluginHealthIndicator`
-- [x] **PluginMetrics** — `@Component` with `@PostConstruct` registering Micrometer counters (`plugins_uploaded_total`, `plugins_loaded_total`, `plugins_unloaded_total`), gauge (`plugins_loaded`), timers (`plugins_load_duration_seconds`, `plugins_unload_duration_seconds`); tagged `plugins_executed_total` counter with `job_name` tag; injected into `JarUploadService`, `DynamicJobLoaderService`, `JobsManagerService`
-- [x] **Service instrumentation** — `JarUploadService.uploadJar()` calls `pluginMetrics.incrementUpload()` after DB persist; `DynamicJobLoaderService` calls `incrementLoad()` + `recordLoadDuration()` on load, `incrementUnload()` + `recordUnloadDuration()` on unload; `JobsManagerService.syncRunJobWithParams()` calls `pluginMetrics.incrementExecuted(request.getJobBeanName())`
-- [x] **Example plugin project** — `example-payment-job/` standalone Maven module at repo root; `PaymentJobPlugin` implementing `BatchJobPlugin` with CSV-reading tasklet (`data/sample-payments.csv`); SPI file `META-INF/services/com.fronzec.api.BatchJobPlugin`; `provided` scope for `batch-job-api:0.0.1-SNAPSHOT`, Spring Batch 6.0.0, Spring Framework 7.0.1, SLF4J 2.0.16; maven-shade-plugin 3.6.0 for platform dep shading; README with build/upload/load/execute/unload instructions
-- [x] **Developer guide rewrite** — `fr-batch-service/docs/job-plugins/developer-guide.md` now covers: lifecycle ASCII diagram (upload→approve→load→execute→unload→audit), REST API reference, JAR signing config, approval workflow, security roles matrix, health/metrics endpoints, 7-entry troubleshooting FAQ
-- [x] **Production checklist** — `fr-batch-service/docs/production-checklist.md` created; checkbox-based checklist covering security, storage, monitoring, scaling, approval workflow, disaster recovery, pre-deployment validation, operational runbooks, final sign-off
-- [x] **120/120 tests passing**, `mvn test` BUILD SUCCESS
-- [x] **Spring Boot 4.0 adaptation**: Health classes use `org.springframework.boot.health.contributor.*` (package migrated from `org.springframework.boot.actuate.health`); `TestRestTemplate` removed (use direct bean injection in integration tests)
-- [x] **Version corrections**: Developer guide updated to reflect Spring Batch 6.0.0 and Spring Framework 7.1.0 (transitive from Spring Boot 4.0.0 parent POM)
 
-**Implementation details**: Four independent deliverables — health indicator, metrics, example plugin, documentation — all additive with no API or schema changes. Health and metrics leverage existing Spring Boot Actuator infrastructure. Example plugin mirrors `DynamicTestPlugin` structure but as a standalone Maven module. 2 PRs stacked on `plugin-architecture-phase-6` branch and merged via stacked-to-main chain. See PRs #44, #45.
+- [x] **PluginHealthIndicator** — `@Component` implementing `HealthIndicator`; queries
+  `PluginRegistryService.getPlugins().size()`,
+  `JobDefinitionRepository.countByLoadStatus("FAILED")`, `Path.of(jarDir).toFile().canRead()`;
+  returns DOWN if failed > 0 or dir inaccessible; exposed at `/actuator/health/plugins` via
+  `management.endpoint.health.group.plugins.include=pluginHealthIndicator`
+- [x] **PluginMetrics** — `@Component` with `@PostConstruct` registering Micrometer counters
+  (`plugins_uploaded_total`, `plugins_loaded_total`, `plugins_unloaded_total`), gauge
+  (`plugins_loaded`), timers (`plugins_load_duration_seconds`, `plugins_unload_duration_seconds`);
+  tagged `plugins_executed_total` counter with `job_name` tag; injected into `JarUploadService`,
+  `DynamicJobLoaderService`, `JobsManagerService`
+- [x] **Service instrumentation** — `JarUploadService.uploadJar()` calls
+  `pluginMetrics.incrementUpload()` after DB persist; `DynamicJobLoaderService` calls
+  `incrementLoad()` + `recordLoadDuration()` on load, `incrementUnload()` + `recordUnloadDuration()`
+  on unload; `JobsManagerService.syncRunJobWithParams()` calls
+  `pluginMetrics.incrementExecuted(request.getJobBeanName())`
+- [x] **Example plugin project** — `example-payment-job/` standalone Maven module at repo root;
+  `PaymentJobPlugin` implementing `BatchJobPlugin` with CSV-reading tasklet
+  (`data/sample-payments.csv`); SPI file `META-INF/services/com.fronzec.api.BatchJobPlugin`;
+  `provided` scope for `batch-job-api:0.0.1-SNAPSHOT`, Spring Batch 6.0.0, Spring Framework 7.0.1,
+  SLF4J 2.0.16; maven-shade-plugin 3.6.0 for platform dep shading; README with
+  build/upload/load/execute/unload instructions
+- [x] **Developer guide rewrite** — `fr-batch-service/docs/job-plugins/developer-guide.md` now
+  covers: lifecycle ASCII diagram (upload→approve→load→execute→unload→audit), REST API reference,
+  JAR signing config, approval workflow, security roles matrix, health/metrics endpoints, 7-entry
+  troubleshooting FAQ
+- [x] **Production checklist** — `fr-batch-service/docs/production-checklist.md` created;
+  checkbox-based checklist covering security, storage, monitoring, scaling, approval workflow,
+  disaster recovery, pre-deployment validation, operational runbooks, final sign-off
+- [x] **120/120 tests passing**, `mvn test` BUILD SUCCESS
+- [x] **Spring Boot 4.0 adaptation**: Health classes use
+  `org.springframework.boot.health.contributor.*` (package migrated from
+  `org.springframework.boot.actuate.health`); `TestRestTemplate` removed (use direct bean injection
+  in integration tests)
+- [x] **Version corrections**: Developer guide updated to reflect Spring Batch 6.0.0 and Spring
+  Framework 7.1.0 (transitive from Spring Boot 4.0.0 parent POM)
+
+**Implementation details**: Four independent deliverables — health indicator, metrics, example
+plugin, documentation — all additive with no API or schema changes. Health and metrics leverage
+existing Spring Boot Actuator infrastructure. Example plugin mirrors `DynamicTestPlugin` structure
+but as a standalone Maven module. 2 PRs stacked on `plugin-architecture-phase-6` branch and merged
+via stacked-to-main chain. See PRs #44, #45.
 
 ### Phase 7: Production Deployment (Future)
+
 - [ ] Deploy to staging environment
 - [ ] Load testing
 - [ ] Operational runbook
@@ -1146,6 +1307,7 @@ public class JobsManagerService {
 ## Success Metrics
 
 ### Phase 1-2 Achieved (May 2026)
+
 - [x] Job registration decoupled from `JobsManagerService` — no more hardcoded map
 - [x] Any `@Component` implementing `BatchJobPlugin` is auto-discovered at startup
 - [x] `batch-job-api` published to GitHub Packages
@@ -1154,6 +1316,7 @@ public class JobsManagerService {
 - [x] Zero production code changes needed to add a new plugin (just add a `@Component`)
 
 ### Technical Metrics (for future phases)
+
 - [ ] Job load time < 5 seconds (dynamic loading)
 - [ ] Memory overhead per loaded job < 50MB
 - [ ] Zero memory leaks after 100 load/unload cycles
@@ -1161,46 +1324,60 @@ public class JobsManagerService {
 - [ ] Support for 50+ concurrent loaded jobs
 
 ### Business Metrics
-- [x] Reduce time to deploy new job from days to hours — **achieved**: new job = new `@Component`, no redeploy architecture
-- [ ] Enable 3+ teams to develop jobs independently — **partial**: contract exists, but plugins still live in same repo
-- [ ] 90% of new jobs deployed without platform changes — **partial**: no platform changes for classpath plugins; external JARs deferred
+
+- [x] Reduce time to deploy new job from days to hours — **achieved**: new job = new `@Component`,
+  no redeploy architecture
+- [ ] Enable 3+ teams to develop jobs independently — **partial**: contract exists, but plugins
+  still live in same repo
+- [ ] 90% of new jobs deployed without platform changes — **partial**: no platform changes for
+  classpath plugins; external JARs deferred
 - [ ] Zero production incidents due to job loading — **not yet in production**
 
 ## Open Questions
 
 1. **Job Versioning Strategy**: Should we support running multiple versions simultaneously?
+
    - **Decision Needed**: Define versioning policy (semantic versioning required?)
 
-2. **Job Dependency Management**: How to handle shared job libraries?
+1. **Job Dependency Management**: How to handle shared job libraries?
+
    - **Options**: Shared classloader, parent context beans, explicit dependencies
 
-3. **Job Approval Process**: Should all uploaded jobs require approval before enabling?
-   - **Options**: Auto-approve for trusted teams, manual approval for all, approval based on environment
+1. **Job Approval Process**: Should all uploaded jobs require approval before enabling?
 
-4. **Storage Strategy**: Where to store JAR files long-term?
+   - **Options**: Auto-approve for trusted teams, manual approval for all, approval based on
+     environment
+
+1. **Storage Strategy**: Where to store JAR files long-term?
+
    - **Options**: Local filesystem, S3, NFS, Artifactory
 
-5. **Hot Reload Impact**: Should running job instances be stopped when reloading?
+1. **Hot Reload Impact**: Should running job instances be stopped when reloading?
+
    - **Options**: Graceful drain, force stop, wait for completion
 
-6. **Multi-instance Deployment**: How to handle job loading across multiple service instances?
+1. **Multi-instance Deployment**: How to handle job loading across multiple service instances?
+
    - **Options**: Shared storage + database coordination, leader election, manual sync
 
 ## References
 
 ### Related Documentation
+
 - [Spring Batch Documentation](https://docs.spring.io/spring-batch/docs/current/reference/html/)
 - [Java ClassLoader Documentation](https://docs.oracle.com/javase/8/docs/api/java/lang/ClassLoader.html)
 - [Spring Boot DevTools (hot reload reference)](https://docs.spring.io/spring-boot/docs/current/reference/html/using.html#using.devtools)
 - [OSGi Dynamic Module System](https://www.osgi.org/developer/architecture/) (inspiration)
 
 ### Similar Implementations
+
 - Jenkins Plugin System
 - Elasticsearch Plugin Architecture
 - Apache Kafka Connect Plugins
 - SonarQube Plugin System
 
 ### Security References
+
 - [OWASP - Deserialization of untrusted data](https://owasp.org/www-community/vulnerabilities/Deserialization_of_untrusted_data)
 - [Java Security Manager (deprecated but concepts relevant)](https://docs.oracle.com/javase/tutorial/essential/environment/security.html)
 
@@ -1213,34 +1390,53 @@ public class JobsManagerService {
 
 ## Review and Approval
 
-| Role | Name | Date | Status |
-|------|------|------|--------|
-| Architect | TBD | TBD | Pending |
-| Security | TBD | TBD | Pending |
-| Operations | TBD | TBD | Pending |
-| Product | TBD | TBD | Pending |
+| Role       | Name | Date | Status  |
+| ---------- | ---- | ---- | ------- |
+| Architect  | TBD  | TBD  | Pending |
+| Security   | TBD  | TBD  | Pending |
+| Operations | TBD  | TBD  | Pending |
+| Product    | TBD  | TBD  | Pending |
 
----
+______________________________________________________________________
 
-**Last Updated**: 2026-05-31 (Phase 6 complete; example, documentation, health & metrics operational)
-**Next Review**: Before starting Phase 7 (production deployment)
+**Last Updated**: 2026-05-31 (Phase 6 complete; example, documentation, health & metrics
+operational) **Next Review**: Before starting Phase 7 (production deployment)
 
 ### Related PRs
-- [#27](https://github.com/fronzec/spring-batch-projects/pull/27) — Phase 1: Foundation (batch-job-api, docs, schema)
-- [#28](https://github.com/fronzec/spring-batch-projects/pull/28) — Phase 2: Plugin registry + Job1Plugin migration
-- [#29](https://github.com/fronzec/spring-batch-projects/pull/29) — Phase 2: sc09-test-fixture (integration test strengthening + H2 fix)
-- [#30](https://github.com/fronzec/spring-batch-projects/pull/30) — Phase 3 PR 1: Flyway + Job Registry JPA Layer
-- [#32](https://github.com/fronzec/spring-batch-projects/pull/32) — Phase 3 PR 3: CRUD Endpoints + Enable/Disable
-- [#33](https://github.com/fronzec/spring-batch-projects/pull/33) — Phase 3 PR 4: PluginRegistryService Extension + Merged API
-- [#34](https://github.com/fronzec/spring-batch-projects/pull/34) — Phase 3 PR 5: GlobalExceptionHandler + Integration Tests (Capstone)
-- [#35](https://github.com/fronzec/spring-batch-projects/pull/35) — Phase 4 PR 1: DynamicJobClassLoader + unit tests
-- [#36](https://github.com/fronzec/spring-batch-projects/pull/36) — Phase 4 PR 2: DynamicJobLoaderService + lifecycle
-- [#37](https://github.com/fronzec/spring-batch-projects/pull/37) — Phase 4 PR 3: Controller endpoints + PluginAutoLoader
-- [#38](https://github.com/fronzec/spring-batch-projects/pull/38) — Phase 4 PR 4: Integration tests + backward compatibility (Capstone)
-- [#39](https://github.com/fronzec/spring-batch-projects/pull/39) — Phase 5 PR 1: ChecksumUtil extraction + load re-verification
-- [#40](https://github.com/fronzec/spring-batch-projects/pull/40) — Phase 5 PR 2: Spring Security baseline (HTTP Basic, role-based access)
-- [#41](https://github.com/fronzec/spring-batch-projects/pull/41) — Phase 5 PR 3: Approval workflow + V2 Flyway migration
-- [#42](https://github.com/fronzec/spring-batch-projects/pull/42) — Phase 5 PR 4: JAR signature verification (strict/permissive modes)
-- [#43](https://github.com/fronzec/spring-batch-projects/pull/43) — Phase 5 PR 5: Audit service + JobExecutionListener
-- [#44](https://github.com/fronzec/spring-batch-projects/pull/44) — Phase 6 PR 1: PluginHealthIndicator + PluginMetrics + service instrumentation
-- [#45](https://github.com/fronzec/spring-batch-projects/pull/45) — Phase 6 PR 2: Example plugin project (example-payment-job/) + developer guide rewrite + production checklist
+
+- [#27](https://github.com/fronzec/spring-batch-projects/pull/27) — Phase 1: Foundation
+  (batch-job-api, docs, schema)
+- [#28](https://github.com/fronzec/spring-batch-projects/pull/28) — Phase 2: Plugin registry +
+  Job1Plugin migration
+- [#29](https://github.com/fronzec/spring-batch-projects/pull/29) — Phase 2: sc09-test-fixture
+  (integration test strengthening + H2 fix)
+- [#30](https://github.com/fronzec/spring-batch-projects/pull/30) — Phase 3 PR 1: Flyway + Job
+  Registry JPA Layer
+- [#32](https://github.com/fronzec/spring-batch-projects/pull/32) — Phase 3 PR 3: CRUD Endpoints +
+  Enable/Disable
+- [#33](https://github.com/fronzec/spring-batch-projects/pull/33) — Phase 3 PR 4:
+  PluginRegistryService Extension + Merged API
+- [#34](https://github.com/fronzec/spring-batch-projects/pull/34) — Phase 3 PR 5:
+  GlobalExceptionHandler + Integration Tests (Capstone)
+- [#35](https://github.com/fronzec/spring-batch-projects/pull/35) — Phase 4 PR 1:
+  DynamicJobClassLoader + unit tests
+- [#36](https://github.com/fronzec/spring-batch-projects/pull/36) — Phase 4 PR 2:
+  DynamicJobLoaderService + lifecycle
+- [#37](https://github.com/fronzec/spring-batch-projects/pull/37) — Phase 4 PR 3: Controller
+  endpoints + PluginAutoLoader
+- [#38](https://github.com/fronzec/spring-batch-projects/pull/38) — Phase 4 PR 4: Integration tests
+  \+ backward compatibility (Capstone)
+- [#39](https://github.com/fronzec/spring-batch-projects/pull/39) — Phase 5 PR 1: ChecksumUtil
+  extraction + load re-verification
+- [#40](https://github.com/fronzec/spring-batch-projects/pull/40) — Phase 5 PR 2: Spring Security
+  baseline (HTTP Basic, role-based access)
+- [#41](https://github.com/fronzec/spring-batch-projects/pull/41) — Phase 5 PR 3: Approval workflow
+  \+ V2 Flyway migration
+- [#42](https://github.com/fronzec/spring-batch-projects/pull/42) — Phase 5 PR 4: JAR signature
+  verification (strict/permissive modes)
+- [#43](https://github.com/fronzec/spring-batch-projects/pull/43) — Phase 5 PR 5: Audit service +
+  JobExecutionListener
+- [#44](https://github.com/fronzec/spring-batch-projects/pull/44) — Phase 6 PR 1:
+  PluginHealthIndicator + PluginMetrics + service instrumentation
+- [#45](https://github.com/fronzec/spring-batch-projects/pull/45) — Phase 6 PR 2: Example plugin
+  project (example-payment-job/) + developer guide rewrite + production checklist
