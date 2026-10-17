@@ -9,6 +9,7 @@ import com.fronzec.api.BatchJobPlugin;
 import com.fronzec.api.JobMetadata;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistrationException;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistryService;
+import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditEvent;
 import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditService;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
@@ -345,6 +346,85 @@ class DynamicJobLoaderServiceTest {
       assertSame(rollbackFailure, loadFailure.getSuppressed()[0]);
       assertSame(candidate, classLoadersOf(service).get(20L));
       verify(candidate, never()).cleanup();
+    }
+  }
+
+  // ── Initial LOADING persistence failures ──────────────────────────────────
+
+  @Test
+  void loadJob_initialLoadingSaveFails_marksFailedWithOriginalCause() throws Exception {
+    JobDefinitionEntity entity = createEntity(21L, "test-job", true, null);
+    RuntimeException initialFailure = new RuntimeException("persisting LOADING failed");
+
+    when(jobDefinitionRepository.findById(21L)).thenReturn(Optional.of(entity));
+    when(jobDefinitionRepository.save(entity))
+        .thenAnswer(
+            invocation -> {
+              if ("LOADING".equals(entity.getLoadStatus())) {
+                throw initialFailure;
+              }
+              return entity;
+            });
+
+    try (MockedConstruction<DynamicJobClassLoader> mocked =
+        mockConstruction(DynamicJobClassLoader.class)) {
+      JobLoadException thrown =
+          assertThrows(JobLoadException.class, () -> service.loadJob(21L));
+
+      assertSame(initialFailure, thrown.getCause());
+      assertEquals(LoadResult.FAILED, entity.getLoadStatus());
+      assertEquals("persisting LOADING failed", entity.getLoadError());
+      assertTrue(mocked.constructed().isEmpty(), "no classloader may be created");
+    }
+
+    verify(pluginRegistryService, never()).registerDynamicPlugin(any());
+    verify(auditService)
+        .logEvent(argThat(event -> AuditEvent.FAILURE.equals(event.outcome())));
+    assertTrue(classLoadersOf(service).isEmpty());
+    assertTrue(lifecycleLocksOf(service).isEmpty(), "lifecycle lock must be released");
+  }
+
+  @Test
+  void loadJob_initialAndFailedSavesFail_keepsOriginalCauseAndSuppressesSecond() {
+    JobDefinitionEntity entity = createEntity(22L, "test-job", true, null);
+    RuntimeException initialFailure = new RuntimeException("persisting LOADING failed");
+    RuntimeException failedSaveFailure = new RuntimeException("persisting FAILED failed");
+
+    when(jobDefinitionRepository.findById(22L)).thenReturn(Optional.of(entity));
+    when(jobDefinitionRepository.save(entity))
+        .thenThrow(initialFailure)
+        .thenThrow(failedSaveFailure);
+
+    JobLoadException thrown = assertThrows(JobLoadException.class, () -> service.loadJob(22L));
+
+    assertSame(initialFailure, thrown.getCause());
+    assertArrayEquals(new Throwable[] {failedSaveFailure}, initialFailure.getSuppressed());
+    assertEquals(LoadResult.FAILED, entity.getLoadStatus());
+  }
+
+  @Test
+  void loadJob_afterInitialLoadingSaveFailure_retrySucceeds() throws Exception {
+    JobDefinitionEntity entity = createEntity(23L, "test-job", true, null);
+
+    when(jobDefinitionRepository.findById(23L)).thenReturn(Optional.of(entity));
+    when(jobDefinitionRepository.save(entity))
+        .thenThrow(new RuntimeException("persisting LOADING failed"))
+        .thenReturn(entity);
+
+    try (MockedConstruction<DynamicJobClassLoader> mocked =
+        mockConstruction(
+            DynamicJobClassLoader.class,
+            (mock, ctx) ->
+                when(mock.loadClass("com.test.TestPlugin"))
+                    .thenAnswer(inv -> TestBatchJobPlugin.class))) {
+      assertThrows(JobLoadException.class, () -> service.loadJob(23L));
+
+      LoadResult result = service.loadJob(23L);
+
+      assertEquals(LoadResult.LOADED, result.status());
+      assertEquals(LoadResult.LOADED, entity.getLoadStatus());
+      assertEquals(1, mocked.constructed().size());
+      verify(pluginRegistryService, times(1)).registerDynamicPlugin(any());
     }
   }
 
