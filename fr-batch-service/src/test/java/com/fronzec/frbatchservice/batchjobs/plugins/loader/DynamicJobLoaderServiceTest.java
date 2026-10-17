@@ -10,10 +10,13 @@ import com.fronzec.api.JobMetadata;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistrationException;
 import com.fronzec.frbatchservice.batchjobs.plugins.PluginRegistryService;
 import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditEvent;
+import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditEventType;
 import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditService;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobParameterTemplateRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.util.ChecksumUtil;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -29,6 +32,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.*;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.batch.core.job.Job;
@@ -38,6 +43,7 @@ import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.batch.infrastructure.repeat.RepeatStatus;
 import org.springframework.context.ApplicationContext;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.PlatformTransactionManager;
 
 @ExtendWith(MockitoExtension.class)
@@ -50,6 +56,8 @@ class DynamicJobLoaderServiceTest {
   @Mock private PlatformTransactionManager transactionManager;
   @Mock private AuditService auditService;
   @Mock private PluginMetrics pluginMetrics;
+  @Mock private JobParameterTemplateRepository jobParameterTemplateRepository;
+  @Mock private JobExecutionAuditRepository jobExecutionAuditRepository;
 
   @InjectMocks private DynamicJobLoaderService service;
 
@@ -532,6 +540,275 @@ class DynamicJobLoaderServiceTest {
     when(jobDefinitionRepository.findById(999L)).thenReturn(Optional.empty());
 
     assertThrows(NoSuchElementException.class, () -> service.unloadJob(999L, false));
+  }
+
+  // ── Delete ────────────────────────────────────────────────────────────────
+
+  /** Returns the single {@code JOB_DELETED} audit event emitted by the service. */
+  private AuditEvent singleDeletedAuditEvent() {
+    ArgumentCaptor<AuditEvent> captor = ArgumentCaptor.forClass(AuditEvent.class);
+    verify(auditService, atLeastOnce()).logEvent(captor.capture());
+    List<AuditEvent> deleted =
+        captor.getAllValues().stream()
+            .filter(event -> event.type() == AuditEventType.JOB_DELETED)
+            .toList();
+    assertEquals(1, deleted.size(), "Expected exactly one JOB_DELETED audit event: " + deleted);
+    return deleted.get(0);
+  }
+
+  @Test
+  void deleteJob_loadedPlugin_unloadsDeletesRowsInOneTransactionThenDeletesJar() throws Exception {
+    JobDefinitionEntity entity = createEntity(40L, "delete-loaded-job", true, LoadResult.LOADED);
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(40L, classLoader);
+    Path jar = Path.of(validJarPath);
+
+    when(jobDefinitionRepository.findById(40L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(40L)).thenReturn(false);
+    when(jobRepository.findRunningJobExecutions("delete-loaded-job"))
+        .thenReturn(Collections.emptySet());
+    doAnswer(
+            invocation -> {
+              assertTrue(Files.exists(jar), "JAR must still exist when the transaction commits");
+              return null;
+            })
+        .when(transactionManager)
+        .commit(any());
+
+    service.deleteJob(40L, false);
+
+    InOrder order =
+        inOrder(pluginRegistryService, jobParameterTemplateRepository, jobDefinitionRepository,
+            transactionManager);
+    order.verify(pluginRegistryService).unregisterDynamicPlugin("delete-loaded-job");
+    order.verify(jobParameterTemplateRepository).deleteByJobDefinitionId(40L);
+    order.verify(jobDefinitionRepository).deleteById(40L);
+    order.verify(transactionManager).commit(any());
+    verify(classLoader).cleanup();
+    assertFalse(classLoadersOf(service).containsKey(40L));
+    assertFalse(Files.exists(jar), "JAR must be deleted after commit");
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, deleted.outcome());
+    assertEquals("delete-loaded-job", deleted.jobName());
+  }
+
+  @Test
+  void deleteJob_notLoadedDefinition_succeeds() {
+    JobDefinitionEntity entity = createEntity(41L, "delete-unloaded-job", true, LoadResult.UNLOADED);
+
+    when(jobDefinitionRepository.findById(41L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(41L)).thenReturn(false);
+    when(jobRepository.findRunningJobExecutions("delete-unloaded-job"))
+        .thenReturn(Collections.emptySet());
+
+    service.deleteJob(41L, false);
+
+    verify(jobParameterTemplateRepository).deleteByJobDefinitionId(41L);
+    verify(jobDefinitionRepository).deleteById(41L);
+    assertFalse(Files.exists(Path.of(validJarPath)));
+    assertEquals(AuditEvent.SUCCESS, singleDeletedAuditEvent().outcome());
+  }
+
+  @Test
+  void deleteJob_runningExecutionsWithoutForce_throwsConflictAndDeletesNothing() throws Exception {
+    JobDefinitionEntity entity = createEntity(42L, "delete-running-job", true, LoadResult.LOADED);
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(42L, classLoader);
+
+    when(jobDefinitionRepository.findById(42L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(42L)).thenReturn(false);
+    when(jobRepository.findRunningJobExecutions("delete-running-job"))
+        .thenReturn(Set.of(mock(JobExecution.class)));
+
+    assertThrows(JobUnloadConflictException.class, () -> service.deleteJob(42L, false));
+
+    verify(pluginRegistryService, never()).unregisterDynamicPlugin(any());
+    verify(classLoader, never()).cleanup();
+    assertSame(classLoader, classLoadersOf(service).get(42L));
+    verifyNoInteractions(jobParameterTemplateRepository, transactionManager);
+    verify(jobDefinitionRepository, never()).deleteById(any());
+    assertTrue(Files.exists(Path.of(validJarPath)), "JAR must be kept on conflict");
+
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, deleted.outcome());
+    assertTrue(deleted.details().contains("id=42"), deleted.details());
+    assertTrue(deleted.details().contains("running execution"), deleted.details());
+  }
+
+  @ParameterizedTest(name = "force={0}")
+  @ValueSource(booleans = {false, true})
+  void deleteJob_executionHistory_throwsDeleteConflictBeforeUnloadEvenWhenForced(boolean force)
+      throws Exception {
+    JobDefinitionEntity entity = createEntity(48L, "delete-history-job", true, LoadResult.LOADED);
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(48L, classLoader);
+
+    when(jobDefinitionRepository.findById(48L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(48L)).thenReturn(true);
+
+    JobDeleteConflictException ex =
+        assertThrows(JobDeleteConflictException.class, () -> service.deleteJob(48L, force));
+    assertTrue(ex.getMessage().contains("execution history"), ex.getMessage());
+    assertTrue(ex.getMessage().contains("disable"), ex.getMessage());
+
+    verifyNoInteractions(
+        pluginRegistryService, jobRepository, jobParameterTemplateRepository, transactionManager);
+    verify(classLoader, never()).cleanup();
+    assertSame(classLoader, classLoadersOf(service).get(48L));
+    verify(jobDefinitionRepository, never()).save(any());
+    verify(jobDefinitionRepository, never()).deleteById(any());
+    assertEquals(LoadResult.LOADED, entity.getLoadStatus());
+    assertTrue(Files.exists(Path.of(validJarPath)), "JAR must be kept on a history conflict");
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, deleted.outcome());
+    assertTrue(deleted.details().contains("id=48"), deleted.details());
+    assertTrue(deleted.details().contains("execution history"), deleted.details());
+    verify(auditService, never())
+        .logEvent(argThat(event -> event.type() == AuditEventType.JOB_UNLOADED));
+  }
+
+  @Test
+  void deleteJob_runningExecutionsWithForce_deletesWithoutTouchingExecutions() {
+    JobDefinitionEntity entity = createEntity(43L, "delete-forced-job", true, LoadResult.LOADED);
+
+    when(jobDefinitionRepository.findById(43L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(43L)).thenReturn(false);
+
+    service.deleteJob(43L, true);
+
+    verify(pluginRegistryService).unregisterDynamicPlugin("delete-forced-job");
+    verify(jobDefinitionRepository).deleteById(43L);
+    verifyNoInteractions(jobRepository);
+    assertEquals(AuditEvent.SUCCESS, singleDeletedAuditEvent().outcome());
+  }
+
+  @Test
+  void deleteJob_missingJar_succeeds() {
+    JobDefinitionEntity entity = createEntity(44L, "delete-missing-jar-job", true, null);
+    String missingJar = tempDir.resolve("already-gone.jar").toString();
+    entity.setJarFilePath(missingJar);
+
+    when(jobDefinitionRepository.findById(44L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(44L)).thenReturn(false);
+
+    service.deleteJob(44L, true);
+
+    verify(jobDefinitionRepository).deleteById(44L);
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, deleted.outcome());
+    assertTrue(deleted.details().contains(missingJar), deleted.details());
+  }
+
+  @Test
+  void deleteJob_jarDeleteFails_stillSucceedsAndNamesOrphanJarInAudit() throws Exception {
+    // A non-empty directory cannot be removed by Files.deleteIfExists, which simulates an
+    // I/O failure on the JAR path after the database transaction committed.
+    Path undeletable = tempDir.resolve("undeletable.jar");
+    Files.createDirectory(undeletable);
+    Files.createFile(undeletable.resolve("blocker"));
+    JobDefinitionEntity entity = createEntity(45L, "delete-orphan-job", true, null);
+    entity.setJarFilePath(undeletable.toString());
+
+    when(jobDefinitionRepository.findById(45L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(45L)).thenReturn(false);
+
+    assertDoesNotThrow(() -> service.deleteJob(45L, true));
+
+    verify(jobDefinitionRepository).deleteById(45L);
+    assertTrue(Files.exists(undeletable));
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, deleted.outcome());
+    assertTrue(deleted.details().contains("orphan"), deleted.details());
+    assertTrue(deleted.details().contains(undeletable.toString()), deleted.details());
+  }
+
+  @Test
+  void deleteJob_databaseDeleteFails_auditsFailureRollsBackAndKeepsJar() {
+    JobDefinitionEntity entity = createEntity(46L, "delete-db-failure-job", true, null);
+    DataIntegrityViolationException failure = new DataIntegrityViolationException("db down");
+
+    when(jobDefinitionRepository.findById(46L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(46L)).thenReturn(false);
+    doThrow(failure).when(jobDefinitionRepository).deleteById(46L);
+
+    DataIntegrityViolationException thrown =
+        assertThrows(DataIntegrityViolationException.class, () -> service.deleteJob(46L, true));
+
+    assertSame(failure, thrown);
+    verify(transactionManager).rollback(any());
+    verify(transactionManager, never()).commit(any());
+    assertTrue(Files.exists(Path.of(validJarPath)), "JAR must be kept when the DB delete fails");
+
+    AuditEvent deleted = singleDeletedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, deleted.outcome());
+    assertEquals("delete-db-failure-job", deleted.jobName());
+    assertTrue(deleted.details().contains("id=46"), deleted.details());
+    assertTrue(deleted.details().contains("db down"), deleted.details());
+  }
+
+  @Test
+  void deleteJob_nonexistentId_throwsNotFoundAndRetainsNoLock() throws Exception {
+    when(jobDefinitionRepository.findById(999L)).thenReturn(Optional.empty());
+
+    assertThrows(NoSuchElementException.class, () -> service.deleteJob(999L, false));
+
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+    verify(jobDefinitionRepository, never()).deleteById(any());
+    verifyNoInteractions(pluginRegistryService, jobParameterTemplateRepository);
+  }
+
+  @Test
+  void deleteJob_holdsDefinitionLockThroughDatabaseDelete() throws Exception {
+    JobDefinitionEntity entity = createEntity(47L, "delete-lock-job", true, LoadResult.LOADED);
+    when(jobDefinitionRepository.findById(47L)).thenReturn(Optional.of(entity));
+    when(jobExecutionAuditRepository.existsByJobDefinitionId(47L)).thenReturn(false);
+
+    AtomicInteger unregisterCalls = new AtomicInteger();
+    CountDownLatch secondUnregisterEntered = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              if (unregisterCalls.incrementAndGet() == 2) {
+                secondUnregisterEntered.countDown();
+              }
+              return null;
+            })
+        .when(pluginRegistryService)
+        .unregisterDynamicPlugin("delete-lock-job");
+
+    CountDownLatch dbDeleteEntered = new CountDownLatch(1);
+    CountDownLatch releaseDbDelete = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              dbDeleteEntered.countDown();
+              assertTrue(releaseDbDelete.await(5, TimeUnit.SECONDS));
+              return null;
+            })
+        .when(jobDefinitionRepository)
+        .deleteById(47L);
+
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    try {
+      Future<?> delete = pool.submit(() -> service.deleteJob(47L, true));
+      assertTrue(dbDeleteEntered.await(5, TimeUnit.SECONDS));
+
+      Future<?> concurrentUnload = pool.submit(() -> service.unloadJob(47L, true));
+      assertFalse(
+          secondUnregisterEntered.await(250, TimeUnit.MILLISECONDS),
+          "Concurrent unload must not enter while delete owns the lifecycle lock");
+
+      releaseDbDelete.countDown();
+      delete.get(5, TimeUnit.SECONDS);
+      concurrentUnload.get(5, TimeUnit.SECONDS);
+      assertEquals(2, unregisterCalls.get());
+      assertTrue(lifecycleLocksOf(service).isEmpty());
+    } finally {
+      releaseDbDelete.countDown();
+      pool.shutdownNow();
+    }
   }
 
   // ── Reload ────────────────────────────────────────────────────────────────

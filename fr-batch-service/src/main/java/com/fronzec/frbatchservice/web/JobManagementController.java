@@ -8,14 +8,10 @@ import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.loader.DynamicJobLoaderService;
 import com.fronzec.frbatchservice.batchjobs.plugins.loader.LoadResult;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
-import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobParameterTemplateRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.service.JarUploadService;
 import com.fronzec.frbatchservice.web.dto.ApprovalRequest;
 import com.fronzec.frbatchservice.web.dto.JarUploadResponse;
 import com.fronzec.frbatchservice.web.dto.JobDefinitionResponse;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -24,7 +20,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -52,7 +47,7 @@ import org.springframework.web.multipart.MultipartFile;
  *   <li>{@code GET  /definitions/{id}} — get single definition</li>
  *   <li>{@code PUT  /definitions/{id}/enable} — enable a definition</li>
  *   <li>{@code PUT  /definitions/{id}/disable} — disable a definition</li>
- *   <li>{@code DELETE /definitions/{id}} — remove DB row + JAR file from disk</li>
+ *   <li>{@code DELETE /definitions/{id}[?force=true]} — unload, delete DB rows, then remove JAR</li>
  *   <li>{@code POST /definitions/{id}/load} — load plugin from JAR into registry</li>
  *   <li>{@code POST /definitions/{id}/unload} — unregister plugin and close classloader</li>
  *   <li>{@code POST /definitions/{id}/reload} — atomic unload + load</li>
@@ -67,19 +62,16 @@ public class JobManagementController {
 
     private final JarUploadService jarUploadService;
     private final JobDefinitionRepository jobDefinitionRepository;
-    private final JobParameterTemplateRepository jobParameterTemplateRepository;
     private final DynamicJobLoaderService loaderService;
     private final AuditService auditService;
 
     public JobManagementController(
             JarUploadService jarUploadService,
             JobDefinitionRepository jobDefinitionRepository,
-            JobParameterTemplateRepository jobParameterTemplateRepository,
             DynamicJobLoaderService loaderService,
             AuditService auditService) {
         this.jarUploadService = jarUploadService;
         this.jobDefinitionRepository = jobDefinitionRepository;
-        this.jobParameterTemplateRepository = jobParameterTemplateRepository;
         this.loaderService = loaderService;
         this.auditService = auditService;
     }
@@ -308,54 +300,30 @@ public class JobManagementController {
     // ─── CRUD: delete ──────────────────────────────────────────────────────────
 
     /**
-     * Hard-deletes a job definition and its parameter template rows, and removes
-     * the associated JAR file from disk.
+     * Deletes a job definition as one lifecycle-coordinated operation, delegated to
+     * {@link DynamicJobLoaderService#deleteJob(Long, boolean)}: the plugin is unloaded
+     * first (unregistered and its classloader released), the parameter templates and
+     * definition row are deleted in one database transaction, and the JAR file is
+     * removed from disk only after that transaction commits.
      *
      * <p>Returns {@code 204 No Content} on success, {@code 404 Not Found} if the
-     * definition does not exist, or {@code 500 Internal Server Error} if file
-     * deletion fails due to an I/O error.
+     * definition does not exist, and {@code 409 Conflict} if the definition has
+     * execution history (disable it instead; {@code force} does not bypass this) or
+     * if the job has running executions and {@code force} is {@code false}. On a
+     * conflict nothing is unloaded or deleted. A missing JAR file, or a JAR that
+     * cannot be removed after commit, does not fail the request; an orphan JAR is
+     * logged and named in the {@code JOB_DELETED} audit.
+     *
+     * @param id    the job definition ID
+     * @param force if {@code true}, delete even when executions are running; running
+     *              executions are not stopped, and the execution-history guard still
+     *              applies
+     * @return {@code 204 No Content} on success
      */
-    @Transactional
     @DeleteMapping("/definitions/{id}")
-    public ResponseEntity<?> deleteDefinition(@PathVariable long id) {
-        Optional<JobDefinitionEntity> opt = jobDefinitionRepository.findById(id);
-        if (opt.isEmpty()) {
-            log.warn("Cannot delete — job definition not found: id={}", id);
-            return ResponseEntity.notFound().build();
-        }
-
-        JobDefinitionEntity entity = opt.get();
-        String jarFilePath = entity.getJarFilePath();
-        String jobName = entity.getJobName();
-
-        // ── audit before deletion (entity is gone afterwards) ──────────────
-        auditService.logEvent(
-            new AuditEvent(
-                AuditEventType.JOB_DELETED,
-                jobName,
-                AuditService.currentUserId(),
-                "Job definition deleted: id=" + id,
-                AuditEvent.SUCCESS,
-                LocalDateTime.now()));
-
-        // Delete the JAR file from disk (if it exists)
-        try {
-            Path jarPath = Path.of(jarFilePath);
-            boolean deleted = Files.deleteIfExists(jarPath);
-            if (deleted) {
-                log.info("JAR file deleted from disk: {}", jarPath);
-            } else {
-                log.warn("JAR file not found on disk (already removed?): {}", jarPath);
-            }
-        } catch (IOException e) {
-            log.error("Failed to delete JAR file from disk: {} — {}", jarFilePath, e.getMessage());
-            throw new RuntimeException("Failed to delete JAR file for definition " + id, e);
-        }
-
-        // Cascade-delete parameter templates, then delete the entity
-        jobParameterTemplateRepository.deleteByJobDefinitionId(id);
-        jobDefinitionRepository.delete(entity);
-        log.info("Job definition deleted: id={}, jobName={}", id, entity.getJobName());
+    public ResponseEntity<Void> deleteDefinition(
+            @PathVariable long id, @RequestParam(defaultValue = "false") boolean force) {
+        loaderService.deleteJob(id, force);
         return ResponseEntity.noContent().build();
     }
 

@@ -20,16 +20,19 @@
                    └─────────────┘
 ```
 
-- **fr-batch-service**: Spring Boot 3.x application serving the plugin management REST API and executing Spring Batch jobs loaded from dynamic plugin JARs.
-- **MySQL 8.2**: Persistent store for job definitions, approval records, audit log, and Spring Batch metadata tables.
+- **fr-batch-service**: Spring Boot 3.x application serving the plugin management REST API and
+  executing Spring Batch jobs loaded from dynamic plugin JARs.
+- **MySQL 8.2**: Persistent store for job definitions, approval records, audit log, and Spring Batch
+  metadata tables.
 - **Prometheus**: Scrapes Micrometer metrics every 15 s from the `/actuator/prometheus` endpoint.
 - **Grafana**: Pre-built dashboard monitoring plugin lifecycle, JVM health, and HTTP error rates.
 
----
+______________________________________________________________________
 
 ## 2. Startup
 
 ### Prerequisites
+
 - Docker Engine ≥ 24.0 and Docker Compose ≥ 2.20 installed.
 - Environment variable `DB_PASSWORD` set (root password for MySQL).
 - Optional: `GRAFANA_PASSWORD` (defaults to `admin`).
@@ -57,9 +60,11 @@ curl -s http://localhost:8080/api/batch-service/jobs/plugins | jq .
 ```
 
 ### Expected result
-All 4 containers show `healthy` in `docker compose ps`. The health endpoint returns `{"status":"UP"}`. Grafana login works and the plugin dashboard shows live metrics.
 
----
+All 4 containers show `healthy` in `docker compose ps`. The health endpoint returns
+`{"status":"UP"}`. Grafana login works and the plugin dashboard shows live metrics.
+
+______________________________________________________________________
 
 ## 3. Shutdown
 
@@ -82,16 +87,18 @@ docker compose down
 ```
 
 ### Force shutdown (emergency)
+
 ```bash
 docker compose down -v   # WARNING: destroys volumes — use only in emergency
 ```
 
 ### Verification
+
 ```bash
 docker compose ps     # Should show "Exited" for all services
 ```
 
----
+______________________________________________________________________
 
 ## 4. Plugin Lifecycle
 
@@ -111,6 +118,7 @@ curl -X POST -u admin:admin123 \
 **Expected**: HTTP 201 Created. Response includes `jobDefinitionId` and `checksumSha256`.
 
 **Error handling**:
+
 - HTTP 400 — invalid JAR, missing manifest, or signature verification failed (strict mode).
 - HTTP 409 — job name already exists. Use `PUT` to update the existing definition.
 - HTTP 413 — JAR exceeds `max-file-size` (50MB default).
@@ -126,7 +134,8 @@ curl -X PUT -u admin:admin123 \
 
 **Expected**: HTTP 200. `approvalStatus` changes to `APPROVED`.
 
-**Note**: In production, `app.plugins.approval.auto-approve=false`, so this step is required before loading.
+**Note**: In production, `app.plugins.approval.auto-approve=false`, so this step is required before
+loading.
 
 ### 4.3 Load a plugin
 
@@ -138,6 +147,7 @@ curl -X POST -u admin:admin123 \
 **Expected**: HTTP 200. Plugin is loaded into the classloader and registered as a Spring Batch job.
 
 **Error handling**:
+
 - HTTP 403 — definition not yet approved.
 - HTTP 409 — already loaded.
 - HTTP 500 — classloader error (check logs for `DynamicJobClassLoader` stack trace).
@@ -161,9 +171,11 @@ curl -X POST -u admin:admin123 \
 **Expected**: HTTP 200. Plugin classloader is closed; job is no longer available for execution.
 
 **Error handling**:
-- HTTP 409 — job is currently executing. Add `?force=true` to force-unload (may interrupt running jobs).
 
----
+- HTTP 409 — job is currently executing. Add `?force=true` to force-unload (may interrupt running
+  jobs).
+
+______________________________________________________________________
 
 ## 5. Backup & Restore
 
@@ -197,7 +209,7 @@ docker compose up -d app
 curl -s http://localhost:8080/api/batch-service/actuator/health
 ```
 
----
+______________________________________________________________________
 
 ## 6. Incident Response
 
@@ -206,6 +218,7 @@ curl -s http://localhost:8080/api/batch-service/actuator/health
 **Symptoms**: `/actuator/health` returns `DOWN`. Load balancer removes instance.
 
 **Diagnosis**:
+
 ```bash
 # Check which component is down
 curl -s http://localhost:8080/api/batch-service/actuator/health | jq .
@@ -218,16 +231,18 @@ docker compose exec app df -h /data/plugins/jars
 ```
 
 **Resolution**:
+
 1. If MySQL is unreachable → check MySQL logs: `docker compose logs mysql`
-2. If disk full → see §6.4
-3. If plugin indicator DOWN → see §6.2
-4. Restart app: `docker compose restart app`
+1. If disk full → see §6.4
+1. If plugin indicator DOWN → see §6.2
+1. Restart app: `docker compose restart app`
 
 ### 6.2 Plugin Load Failure
 
 **Symptoms**: `POST /load` returns HTTP 500. Plugin appears as UNLOADED.
 
 **Diagnosis**:
+
 ```bash
 # Check app logs for classloader errors
 docker compose logs app | grep -i "classloader\|LoadFailure"
@@ -240,15 +255,18 @@ docker compose exec mysql mysql -u root -p"${DB_PASSWORD}" -e \
 ```
 
 **Resolution**:
+
 1. Corrupted JAR → re-upload: `POST /jobs/upload`
-2. Missing dependency in JAR → check `MANIFEST.MF` classpath
-3. Signature mismatch → re-sign JAR or temporarily set `app.plugins.signature.mode=permissive` during investigation
+1. Missing dependency in JAR → check `MANIFEST.MF` classpath
+1. Signature mismatch → re-sign JAR or temporarily set `app.plugins.signature.mode=permissive`
+   during investigation
 
 ### 6.3 Execution Error
 
 **Symptoms**: Job fails with `FAILED` status. Exception in logs.
 
 **Diagnosis**:
+
 ```bash
 # View recent job executions
 curl -s -u admin:admin123 \
@@ -259,30 +277,42 @@ docker compose logs app | grep "executionId={id}"
 ```
 
 **Resolution**:
+
 1. Review job logic in plugin JAR (business error)
-2. Force-stop stuck execution: `POST /jobs/executions/{id}/stop`
-3. Unload and reload the plugin if it left corrupted state
-4. If job requires data fix, run ad-hoc SQL after unload
+1. Force-stop stuck execution: `POST /jobs/executions/{id}/stop`
+1. Unload and reload the plugin if it left corrupted state
+1. If job requires data fix, run ad-hoc SQL after unload
 
 ### 6.4 Disk Full
 
 **Symptoms**: Uploads fail with HTTP 507. Write errors in logs.
 
 **Diagnosis**:
+
 ```bash
 docker compose exec app df -h /data/plugins/jars
 docker compose exec app du -sh /data/plugins/jars/*
 ```
 
 **Resolution**:
+
 1. Identify stale/orphaned JARs (not referenced in `job_definitions` table)
-2. Remove orphaned JARs inside the container (never on the host): `docker compose exec app sh -c 'test -f /data/plugins/jars/{orphanId}.jar && rm /data/plugins/jars/{orphanId}.jar'`
-3. Unload and delete unused job definitions: `DELETE /jobs/definitions/{id}`
-4. Expand Docker volume: `docker volume create --opt size=10G plugin-jars` (requires volume recreation)
+1. Remove orphaned JARs inside the container (never on the host):
+   `docker compose exec app sh -c 'test -f /data/plugins/jars/{orphanId}.jar && rm /data/plugins/jars/{orphanId}.jar'`
+1. Delete unused job definitions with `DELETE /jobs/definitions/{id}`; the plugin is unloaded
+   automatically and the JAR is removed after the database commit. A `409` either means the
+   definition has execution history (it cannot be deleted, even with `?force=true`; disable it with
+   `PUT /jobs/definitions/{id}/disable` instead) or that executions are running (retry later or use
+   `?force=true`; running executions are not stopped). The error message says which. If the JAR
+   cannot be removed, the delete still succeeds and the `JOB_DELETED` audit names the orphan JAR
+   path to clean up with step 2.
+1. Expand Docker volume: `docker volume create --opt size=10G plugin-jars` (requires volume
+   recreation)
 
-**Escalation**: If disk usage exceeds 90% despite cleanup, expand the host partition or migrate to a larger volume.
+**Escalation**: If disk usage exceeds 90% despite cleanup, expand the host partition or migrate to a
+larger volume.
 
----
+______________________________________________________________________
 
 ## 7. Monitoring
 
@@ -330,9 +360,10 @@ groups:
 ### Grafana Dashboard
 
 Import `fr-batch-service/docs/grafana-dashboard.json` via:
+
 1. Grafana → Dashboards → New → Import
-2. Upload JSON file or paste content
-3. Select the Prometheus datasource
+1. Upload JSON file or paste content
+1. Select the Prometheus datasource
 
 ### Log Locations
 
@@ -341,12 +372,13 @@ Import `fr-batch-service/docs/grafana-dashboard.json` via:
 - **Prometheus logs**: `docker compose logs prometheus`
 - **Grafana logs**: `docker compose logs grafana`
 
-For centralized logging in production, configure a logging driver (`json-file`, `fluentd`, `loki`) in `docker-compose.yml`.
+For centralized logging in production, configure a logging driver (`json-file`, `fluentd`, `loki`)
+in `docker-compose.yml`.
 
 ### Escalation Contacts
 
-| Role | Contact |
-|------|---------|
-| Primary on-call | [TBD — update before deployment] |
-| Secondary on-call | [TBD] |
-| Platform engineering | [TBD] |
+| Role                 | Contact                          |
+| -------------------- | -------------------------------- |
+| Primary on-call      | [TBD — update before deployment] |
+| Secondary on-call    | [TBD]                            |
+| Platform engineering | [TBD]                            |

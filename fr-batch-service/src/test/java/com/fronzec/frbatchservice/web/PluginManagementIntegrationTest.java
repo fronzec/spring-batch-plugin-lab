@@ -241,6 +241,13 @@ class PluginManagementIntegrationTest {
     mockMvc
         .perform(get(JOBS_BASE + "/definitions/" + createdDefinitionId))
         .andExpect(status().isNotFound());
+
+    // A repeated DELETE of the same id is now an unknown definition: 404 error envelope
+    mockMvc
+        .perform(delete(JOBS_BASE + "/definitions/" + createdDefinitionId))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.status").value(404))
+        .andExpect(jsonPath("$.path").value(JOBS_BASE + "/definitions/" + createdDefinitionId));
   }
 
   // ─── merged plugins endpoint ───────────────────────────────────────────────
