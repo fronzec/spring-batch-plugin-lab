@@ -3,11 +3,16 @@ package com.fronzec.frbatchservice.batchjobs.plugins.service;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.fronzec.frbatchservice.batchjobs.plugins.audit.AuditService;
@@ -22,6 +27,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.stream.Stream;
 import java.util.Optional;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
@@ -113,6 +119,133 @@ class JarUploadServiceTest {
         captor.getValue().getJarChecksum(),
         "persisted checksum must be the digest of the stored file");
     assertEquals("disk-digest", response.jarChecksum(), "response must expose the same checksum");
+  }
+
+  // ─── replacement JAR storage ───────────────────────────────────────────────
+
+  @Test
+  @DisplayName("stores a replacement JAR under a unique name without overwriting the current file")
+  void storeReplacementJar_storesUniqueFileWithoutOverwritingCurrentJar() throws IOException {
+    Path currentJar = jarDir.resolve("test-job-1.0.0.jar");
+    Files.write(currentJar, "current".getBytes());
+    byte[] jarBytes = minimalJar();
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(true, null, List.of()));
+
+    JarUploadService.StoredJar first =
+        service.storeReplacementJar(
+            replacementFile(jarBytes), "test-job", "1.0.0", "com.example.MyPlugin");
+    JarUploadService.StoredJar second =
+        service.storeReplacementJar(
+            replacementFile(jarBytes), "test-job", "1.0.0", "com.example.MyPlugin");
+
+    assertNotEquals(currentJar, first.path());
+    assertNotEquals(first.path(), second.path(), "each replacement must get a unique file name");
+    assertTrue(
+        first.path().getFileName().toString().matches("test-job-1\\.0\\.0-[0-9a-f]{8}\\.jar"),
+        first.path().toString());
+    assertEquals(jarDir.toAbsolutePath().normalize(), first.path().getParent());
+    assertArrayEquals(jarBytes, Files.readAllBytes(first.path()));
+    assertArrayEquals(
+        "current".getBytes(), Files.readAllBytes(currentJar), "current JAR must be untouched");
+    assertEquals(ChecksumUtil.computeSha256(first.path()), first.checksum());
+    verifyNoInteractions(jobDefinitionRepository, auditService);
+  }
+
+  @Test
+  @DisplayName("rejects a replacement JAR that does not contain the main class and stores nothing")
+  void storeReplacementJar_missingMainClassEntry_rejectsAndLeavesNoFile() throws IOException {
+    InvalidJarException ex =
+        assertThrows(
+            InvalidJarException.class,
+            () ->
+                service.storeReplacementJar(
+                    replacementFile(minimalJar()), "test-job", "2.0.0", "com.example.Other"));
+
+    assertTrue(ex.getMessage().contains("com.example.Other"), ex.getMessage());
+    assertEquals(0, filesIn(jarDir));
+    verifyNoInteractions(jarSignatureVerifier);
+  }
+
+  @Test
+  @DisplayName("rejects a replacement that is not a JAR before storing anything")
+  void storeReplacementJar_notAJar_rejectsWithoutStoring() throws IOException {
+    MockMultipartFile notAJar =
+        new MockMultipartFile("file", "plugin.jar", "application/java-archive", "hello".getBytes());
+
+    assertThrows(
+        InvalidJarException.class,
+        () -> service.storeReplacementJar(notAJar, "test-job", "2.0.0", "com.example.MyPlugin"));
+
+    assertEquals(0, filesIn(jarDir));
+    verifyNoInteractions(jarSignatureVerifier);
+  }
+
+  @Test
+  @DisplayName("deletes the stored replacement when strict signature verification fails")
+  void storeReplacementJar_strictSignatureFailure_rejectsAndDeletesStoredFile() throws IOException {
+    JarUploadService strictService =
+        new JarUploadService(
+            jobDefinitionRepository,
+            Optional.<AutoApproveConfig>empty(),
+            jarSignatureVerifier,
+            auditService,
+            pluginMetrics,
+            "strict",
+            jarDir.toString());
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(false, null, List.of("unsigned")));
+
+    InvalidJarException ex =
+        assertThrows(
+            InvalidJarException.class,
+            () ->
+                strictService.storeReplacementJar(
+                    replacementFile(minimalJar()), "test-job", "2.0.0", "com.example.MyPlugin"));
+
+    assertTrue(ex.getMessage().contains("strict"), ex.getMessage());
+    assertEquals(0, filesIn(jarDir));
+  }
+
+  // ─── auto-approval ─────────────────────────────────────────────────────────
+
+  @Test
+  @DisplayName("auto-approves and re-saves a definition when auto-approval is configured")
+  void autoApproveIfEnabled_withConfig_approvesAndSaves() {
+    AutoApproveConfig autoApprove = mock(AutoApproveConfig.class);
+    JarUploadService autoApproveService =
+        new JarUploadService(
+            jobDefinitionRepository,
+            Optional.of(autoApprove),
+            jarSignatureVerifier,
+            auditService,
+            pluginMetrics,
+            "permissive",
+            jarDir.toString());
+    JobDefinitionEntity entity = new JobDefinitionEntity();
+
+    assertTrue(autoApproveService.autoApproveIfEnabled(entity));
+
+    verify(autoApprove).approve(entity);
+    verify(jobDefinitionRepository).save(entity);
+  }
+
+  @Test
+  @DisplayName("leaves a definition untouched when auto-approval is not configured")
+  void autoApproveIfEnabled_withoutConfig_returnsFalseWithoutSaving() {
+    assertFalse(service.autoApproveIfEnabled(new JobDefinitionEntity()));
+
+    verifyNoInteractions(jobDefinitionRepository);
+  }
+
+  private static MockMultipartFile replacementFile(byte[] jarBytes) {
+    return new MockMultipartFile("file", "plugin.jar", "application/java-archive", jarBytes);
+  }
+
+  private static long filesIn(Path dir) throws IOException {
+    try (Stream<Path> files = Files.list(dir)) {
+      return files.count();
+    }
   }
 
   /** Builds a minimal valid (unsigned) JAR with a manifest and one entry. */

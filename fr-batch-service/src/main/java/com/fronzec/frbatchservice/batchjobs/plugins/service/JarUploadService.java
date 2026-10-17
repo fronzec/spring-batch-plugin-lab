@@ -12,6 +12,7 @@ import com.fronzec.frbatchservice.config.AutoApproveConfig;
 import com.fronzec.frbatchservice.web.dto.JarUploadResponse;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.Path;
@@ -20,6 +21,8 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.jar.JarFile;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +38,10 @@ import org.springframework.web.multipart.MultipartFile;
  *
  * <p>Uploaded JARs default to {@code enabled=false} and {@code loadStatus=UNLOADED}.
  * Dynamic registration from the stored JAR is handled in Phase 4.
+ *
+ * <p>Also validates and stores replacement JARs for existing definitions (see
+ * {@link #storeReplacementJar}); the replacement itself is coordinated by
+ * {@code DynamicJobLoaderService#replaceJar}.
  */
 @Service
 public class JarUploadService {
@@ -62,6 +69,14 @@ public class JarUploadService {
   private final PluginMetrics pluginMetrics;
   private final boolean signatureStrict;
   private final String jarDir;
+
+  /**
+   * A validated replacement JAR stored on disk but not yet referenced by any definition.
+   *
+   * @param path the absolute path of the stored file
+   * @param checksum the SHA-256 checksum computed from the stored file
+   */
+  public record StoredJar(Path path, String checksum) {}
 
   public JarUploadService(
       JobDefinitionRepository jobDefinitionRepository,
@@ -108,32 +123,13 @@ public class JarUploadService {
     // stored digest matches the bytes that load-time integrity verification re-checks.
     String checksum = ChecksumUtil.computeSha256(storedPath);
 
-    // ── signature verification ───────────────────────────────────────────────
-    SignatureResult sigResult = jarSignatureVerifier.verify(storedPath);
-    if (!sigResult.valid()) {
-      List<String> warnings = sigResult.warnings();
-      if (signatureStrict) {
-        throw new InvalidJarException(
-            "JAR signature verification failed in strict mode: " + String.join("; ", warnings));
-      }
-      // Permissive: log and allow upload
-      log.warn(
-          "JAR signature verification issues (permissive mode — upload allowed): {}",
-          warnings);
-    }
+    verifySignature(storedPath);
 
     JobDefinitionEntity entity = persistMetadata(jobName, version, mainClassName, checksum, storedPath);
 
         pluginMetrics.incrementUpload();
 
-        // Auto-approve in non-production profiles (no-op when AutoApproveConfig is absent).
-        // approve() only mutates the entity in memory, and persistMetadata's save has
-        // already committed it as PENDING, so re-save to persist the approval.
-        autoApproveConfig.ifPresent(
-            ac -> {
-              ac.approve(entity);
-              jobDefinitionRepository.save(entity);
-            });
+        autoApproveIfEnabled(entity);
 
         log.info(
                 "JAR uploaded: job={}, version={}, id={}, checksum={}",
@@ -162,6 +158,70 @@ public class JarUploadService {
                   LocalDateTime.now()));
           throw e;
         }
+    }
+
+    /**
+     * Validates a replacement JAR for an existing definition and stores it under a unique
+     * file name, {@code {jarDir}/{jobName}-{version}-{random}.jar}.
+     *
+     * <p>Runs the same checks as {@link #uploadJar}: {@code .jar} extension, ZIP magic bytes,
+     * fully-qualified main class name, a checksum computed from the stored bytes, and the
+     * configured signature policy. In addition, the JAR must contain the main class entry.
+     * No plugin code is executed. The file is created without replacing any existing file,
+     * so the definition's current JAR is never overwritten. If a check fails after the file
+     * was stored, the file is deleted before the exception propagates.
+     *
+     * <p>This method does not touch the database or the audit trail; the caller owns both.
+     *
+     * @param file          the uploaded replacement JAR
+     * @param jobName       the job name of the definition being replaced
+     * @param version       the version of the replacement
+     * @param mainClassName fully-qualified class name of the {@code BatchJobPlugin} impl
+     * @return the stored file and its checksum
+     * @throws InvalidJarException if the file fails validation
+     */
+    public StoredJar storeReplacementJar(
+            MultipartFile file, String jobName, String version, String mainClassName) {
+        validateJar(file);
+        validateMainClassName(mainClassName);
+
+        String uniqueSuffix = "-" + UUID.randomUUID().toString().substring(0, 8);
+        // No REPLACE_EXISTING: a name collision fails instead of overwriting a stored JAR.
+        Path storedPath = storeFile(file, jobName, version, uniqueSuffix);
+        try {
+            requireMainClassEntry(storedPath, mainClassName);
+            String checksum = ChecksumUtil.computeSha256(storedPath);
+            verifySignature(storedPath);
+            log.debug("Replacement JAR stored at {} (checksum={})", storedPath, checksum);
+            return new StoredJar(storedPath, checksum);
+        } catch (RuntimeException e) {
+            try {
+                Files.deleteIfExists(storedPath);
+            } catch (IOException deleteEx) {
+                e.addSuppressed(deleteEx);
+                log.warn("Could not delete rejected replacement JAR {}: {}", storedPath, deleteEx.toString());
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Applies the non-production auto-approval to a persisted definition and saves it again.
+     *
+     * <p>A no-op when {@link AutoApproveConfig} is absent (production, or auto-approval
+     * disabled). {@code approve()} only mutates the entity in memory, so the entity is
+     * re-saved to persist the approval.
+     *
+     * @param entity the persisted definition to approve
+     * @return {@code true} if the definition was auto-approved
+     */
+    public boolean autoApproveIfEnabled(JobDefinitionEntity entity) {
+        if (autoApproveConfig.isEmpty()) {
+            return false;
+        }
+        autoApproveConfig.get().approve(entity);
+        jobDefinitionRepository.save(entity);
+        return true;
     }
 
     // ─── validation ────────────────────────────────────────────────────────────
@@ -205,6 +265,44 @@ public class JarUploadService {
         }
     }
 
+    /**
+     * Requires the stored JAR to contain the class file of {@code mainClassName}, without
+     * loading or executing it.
+     *
+     * @throws InvalidJarException if the entry is missing or the JAR cannot be read
+     */
+    private void requireMainClassEntry(Path jarPath, String mainClassName) {
+        String entryName = mainClassName.replace('.', '/') + ".class";
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            if (jar.getEntry(entryName) == null) {
+                throw new InvalidJarException(
+                        "Main class " + mainClassName + " not found in JAR (expected entry " + entryName + ")");
+            }
+        } catch (IOException e) {
+            throw new InvalidJarException("File is not a readable JAR: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Applies the configured signature policy: strict mode rejects an invalid signature,
+     * permissive mode logs the issues and allows the JAR.
+     *
+     * @throws InvalidJarException if verification fails in strict mode
+     */
+    private void verifySignature(Path storedPath) {
+        SignatureResult sigResult = jarSignatureVerifier.verify(storedPath);
+        if (!sigResult.valid()) {
+            List<String> warnings = sigResult.warnings();
+            if (signatureStrict) {
+                throw new InvalidJarException(
+                        "JAR signature verification failed in strict mode: " + String.join("; ", warnings));
+            }
+            log.warn(
+                    "JAR signature verification issues (permissive mode — JAR allowed): {}",
+                    warnings);
+        }
+    }
+
     /** Reads up to {@code n} bytes from the beginning of the file. */
     private byte[] readHeader(MultipartFile file, int n) {
         try (InputStream in = file.getInputStream()) {
@@ -240,8 +338,17 @@ public class JarUploadService {
 
     // ─── file storage ──────────────────────────────────────────────────────────
 
-    /** Stores the JAR to {@code {jarDir}/{jobName}-{version}.jar}. */
+    /** Stores the JAR to {@code {jarDir}/{jobName}-{version}.jar}, replacing an existing file. */
     private Path storeFile(MultipartFile file, String jobName, String version) {
+        return storeFile(file, jobName, version, "", StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /**
+     * Stores the JAR to {@code {jarDir}/{jobName}-{version}{suffix}.jar} with the given copy
+     * options; without {@code REPLACE_EXISTING} an existing file makes the copy fail.
+     */
+    private Path storeFile(
+            MultipartFile file, String jobName, String version, String suffix, CopyOption... options) {
         String safeJobName = sanitizeNameComponent(jobName);
         String safeVersion = sanitizeNameComponent(version);
 
@@ -252,7 +359,7 @@ public class JarUploadService {
             throw new RuntimeException("Failed to create JAR storage directory: " + jarDir, e);
         }
 
-        String filename = safeJobName + "-" + safeVersion + ".jar";
+        String filename = safeJobName + "-" + safeVersion + suffix + ".jar";
         Path target = dir.resolve(filename);
 
         // Defence-in-depth: verify the resolved path is still under jarDir
@@ -263,7 +370,7 @@ public class JarUploadService {
         }
 
         try {
-            Files.copy(file.getInputStream(), target, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(file.getInputStream(), target, options);
         } catch (IOException e) {
             throw new RuntimeException("Failed to store JAR at " + target, e);
         }
