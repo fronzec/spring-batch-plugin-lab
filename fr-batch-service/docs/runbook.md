@@ -256,7 +256,9 @@ docker compose exec mysql mysql -u root -p"${DB_PASSWORD}" -e \
 
 **Resolution**:
 
-1. Corrupted JAR → re-upload: `POST /jobs/upload`
+1. Corrupted JAR → replace it in place: `PUT /jobs/definitions/{id}/jar` (multipart `file`,
+   `version`, `mainClassName`), then approve (`PUT /jobs/definitions/{id}/approve`) and load
+   (`POST /jobs/definitions/{id}/load`). The definition keeps its ID and execution history.
 1. Missing dependency in JAR → check `MANIFEST.MF` classpath
 1. Signature mismatch → re-sign JAR or temporarily set `app.plugins.signature.mode=permissive`
    during investigation

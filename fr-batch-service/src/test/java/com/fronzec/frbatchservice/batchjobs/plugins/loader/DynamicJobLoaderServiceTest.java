@@ -17,6 +17,8 @@ import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobParameterTemplateRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.service.InvalidJarException;
+import com.fronzec.frbatchservice.batchjobs.plugins.service.JarUploadService;
 import com.fronzec.frbatchservice.batchjobs.plugins.util.ChecksumUtil;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -44,6 +46,7 @@ import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.batch.infrastructure.repeat.RepeatStatus;
 import org.springframework.context.ApplicationContext;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.transaction.PlatformTransactionManager;
 
 @ExtendWith(MockitoExtension.class)
@@ -58,6 +61,7 @@ class DynamicJobLoaderServiceTest {
   @Mock private PluginMetrics pluginMetrics;
   @Mock private JobParameterTemplateRepository jobParameterTemplateRepository;
   @Mock private JobExecutionAuditRepository jobExecutionAuditRepository;
+  @Mock private JarUploadService jarUploadService;
 
   @InjectMocks private DynamicJobLoaderService service;
 
@@ -807,6 +811,364 @@ class DynamicJobLoaderServiceTest {
       assertTrue(lifecycleLocksOf(service).isEmpty());
     } finally {
       releaseDbDelete.countDown();
+      pool.shutdownNow();
+    }
+  }
+
+  // ── Replace JAR ───────────────────────────────────────────────────────────
+
+  private static final String NEW_VERSION = "2.0.0";
+  private static final String NEW_MAIN_CLASS = "com.test.ReplacementPlugin";
+
+  private final MockMultipartFile replacementUpload =
+      new MockMultipartFile("file", "replacement.jar", "application/java-archive", new byte[] {1});
+
+  /** Returns the single {@code JAR_REPLACED} audit event emitted by the service. */
+  private AuditEvent singleReplacedAuditEvent() {
+    ArgumentCaptor<AuditEvent> captor = ArgumentCaptor.forClass(AuditEvent.class);
+    verify(auditService, atLeastOnce()).logEvent(captor.capture());
+    List<AuditEvent> replaced =
+        captor.getAllValues().stream()
+            .filter(event -> event.type() == AuditEventType.JAR_REPLACED)
+            .toList();
+    assertEquals(1, replaced.size(), "Expected exactly one JAR_REPLACED audit event: " + replaced);
+    return replaced.get(0);
+  }
+
+  /** Creates a stored replacement JAR on disk, as {@link JarUploadService} would. */
+  private JarUploadService.StoredJar storedReplacement(String jobName) throws IOException {
+    Path stored = tempDir.resolve(jobName + "-" + NEW_VERSION + "-0a1b2c3d.jar");
+    Files.write(stored, new byte[] {1});
+    return new JarUploadService.StoredJar(stored, "new-checksum");
+  }
+
+  private void stubSaveReturnsArgument() {
+    when(jobDefinitionRepository.save(any(JobDefinitionEntity.class)))
+        .thenAnswer(invocation -> invocation.getArgument(0));
+  }
+
+  @Test
+  void replaceJar_loadedPlugin_storesThenUnloadsUpdatesDefinitionResetsApprovalThenDeletesOldJar()
+      throws Exception {
+    JobDefinitionEntity entity = createEntity(60L, "replace-job", true, LoadResult.LOADED);
+    entity.setVersion("1.0.0");
+    entity.setApprovedBy("alice");
+    entity.setApprovedAt(java.time.LocalDateTime.now());
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(60L, classLoader);
+    Path oldJar = Path.of(validJarPath);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-job");
+
+    when(jobDefinitionRepository.findById(60L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-job")).thenReturn(Collections.emptySet());
+    when(jarUploadService.storeReplacementJar(
+            replacementUpload, "replace-job", NEW_VERSION, NEW_MAIN_CLASS))
+        .thenReturn(newJar);
+    stubSaveReturnsArgument();
+    doAnswer(
+            invocation -> {
+              assertTrue(Files.exists(oldJar), "Old JAR must still exist when the update commits");
+              return null;
+            })
+        .when(transactionManager)
+        .commit(any());
+
+    JobDefinitionEntity result =
+        service.replaceJar(60L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS);
+
+    InOrder order = inOrder(pluginRegistryService, jarUploadService, transactionManager);
+    order.verify(jarUploadService)
+        .storeReplacementJar(replacementUpload, "replace-job", NEW_VERSION, NEW_MAIN_CLASS);
+    order.verify(pluginRegistryService).unregisterDynamicPlugin("replace-job");
+    order.verify(transactionManager).commit(any());
+    order.verify(jarUploadService).autoApproveIfEnabled(result);
+    verify(classLoader).cleanup();
+    assertFalse(classLoadersOf(service).containsKey(60L));
+
+    assertEquals(60L, result.getId());
+    assertEquals("replace-job", result.getJobName());
+    assertEquals(newJar.path().toString(), result.getJarFilePath());
+    assertEquals("new-checksum", result.getJarChecksum());
+    assertEquals(NEW_VERSION, result.getVersion());
+    assertEquals(NEW_MAIN_CLASS, result.getMainClassName());
+    assertEquals("PENDING", result.getApprovalStatus());
+    assertNull(result.getApprovedBy());
+    assertNull(result.getApprovedAt());
+    assertEquals(LoadResult.UNLOADED, result.getLoadStatus());
+    assertTrue(result.getEnabled(), "enabled must be unchanged");
+
+    assertFalse(Files.exists(oldJar), "Old JAR must be deleted after commit");
+    assertTrue(Files.exists(newJar.path()));
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, replaced.outcome());
+    assertEquals("replace-job", replaced.jobName());
+    assertTrue(replaced.details().contains("id=60"), replaced.details());
+    assertTrue(replaced.details().contains(NEW_VERSION), replaced.details());
+    assertTrue(replaced.details().contains("PENDING"), replaced.details());
+    assertTrue(replaced.details().contains(validJarPath), replaced.details());
+  }
+
+  @Test
+  void replaceJar_autoApproveFails_stillSucceedsWithPendingApproval() throws Exception {
+    JobDefinitionEntity entity = createEntity(61L, "replace-approve-job", false, null);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-approve-job");
+
+    when(jobDefinitionRepository.findById(61L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-approve-job"))
+        .thenReturn(Collections.emptySet());
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
+    stubSaveReturnsArgument();
+    when(jarUploadService.autoApproveIfEnabled(any()))
+        .thenAnswer(
+            invocation -> {
+              JobDefinitionEntity target = invocation.getArgument(0);
+              target.setApprovalStatus("APPROVED");
+              target.setApprovedBy("system");
+              throw new DataIntegrityViolationException("approve save failed");
+            });
+
+    JobDefinitionEntity result =
+        service.replaceJar(61L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS);
+
+    assertEquals("PENDING", result.getApprovalStatus());
+    assertNull(result.getApprovedBy());
+    assertFalse(result.getEnabled(), "enabled must be unchanged");
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, replaced.outcome());
+    assertTrue(replaced.details().contains("auto-approval failed"), replaced.details());
+  }
+
+  @Test
+  void replaceJar_runningExecutions_throwsConflictDiscardsNewJarAndChangesNothing()
+      throws Exception {
+    JobDefinitionEntity entity = createEntity(62L, "replace-running-job", true, LoadResult.LOADED);
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(62L, classLoader);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-running-job");
+
+    when(jobDefinitionRepository.findById(62L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-running-job"))
+        .thenReturn(Set.of(mock(JobExecution.class)));
+    // The new JAR is validated and stored before the unload rejects the running executions.
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
+
+    assertThrows(
+        JobUnloadConflictException.class,
+        () -> service.replaceJar(62L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+
+    verifyNoInteractions(transactionManager);
+    verify(jarUploadService, never()).autoApproveIfEnabled(any());
+    verify(pluginRegistryService, never()).unregisterDynamicPlugin(any());
+    verify(classLoader, never()).cleanup();
+    assertSame(classLoader, classLoadersOf(service).get(62L));
+    verify(jobDefinitionRepository, never()).save(any());
+    assertEquals(validJarPath, entity.getJarFilePath());
+    assertEquals(LoadResult.LOADED, entity.getLoadStatus(), "the plugin must stay loaded");
+    assertTrue(Files.exists(Path.of(validJarPath)), "Current JAR must be kept on conflict");
+    assertFalse(Files.exists(newJar.path()), "The stored new JAR must be discarded on conflict");
+    try (var files = Files.list(tempDir)) {
+      assertEquals(1, files.count(), "No new JAR may be left behind");
+    }
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, replaced.outcome());
+    assertTrue(replaced.details().contains("id=62"), replaced.details());
+    assertTrue(replaced.details().contains("running execution"), replaced.details());
+    assertTrue(replaced.details().contains("Nothing was changed"), replaced.details());
+    assertTrue(replaced.details().contains(newJar.path() + " was deleted"), replaced.details());
+  }
+
+  @Test
+  void replaceJar_invalidJar_throwsAndKeepsLoadedPluginDefinitionAndCurrentJar() throws Exception {
+    JobDefinitionEntity entity = createEntity(63L, "replace-invalid-job", true, LoadResult.LOADED);
+    entity.setVersion("1.0.0");
+    DynamicJobClassLoader classLoader = mock(DynamicJobClassLoader.class);
+    classLoadersOf(service).put(63L, classLoader);
+    InvalidJarException invalid = new InvalidJarException("Main class not found in JAR");
+
+    when(jobDefinitionRepository.findById(63L)).thenReturn(Optional.of(entity));
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenThrow(invalid);
+
+    InvalidJarException thrown =
+        assertThrows(
+            InvalidJarException.class,
+            () -> service.replaceJar(63L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+
+    assertSame(invalid, thrown);
+    verifyNoInteractions(transactionManager);
+    verify(jarUploadService, never()).autoApproveIfEnabled(any());
+    verify(pluginRegistryService, never()).unregisterDynamicPlugin(any());
+    verify(classLoader, never()).cleanup();
+    assertSame(classLoader, classLoadersOf(service).get(63L), "the plugin must stay loaded");
+    verify(jobDefinitionRepository, never()).save(any());
+    assertEquals(validJarPath, entity.getJarFilePath());
+    assertEquals(validJarChecksum, entity.getJarChecksum());
+    assertEquals("1.0.0", entity.getVersion());
+    assertEquals("APPROVED", entity.getApprovalStatus());
+    assertEquals(LoadResult.LOADED, entity.getLoadStatus(), "the load status is unchanged");
+    assertTrue(Files.exists(Path.of(validJarPath)), "Current JAR must be kept");
+    try (var files = Files.list(tempDir)) {
+      assertEquals(1, files.count(), "No new JAR may be left behind");
+    }
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, replaced.outcome());
+    assertTrue(replaced.details().contains("id=63"), replaced.details());
+    assertTrue(replaced.details().contains("Main class not found"), replaced.details());
+    assertTrue(replaced.details().contains("Nothing was changed"), replaced.details());
+    assertTrue(replaced.details().contains("no new JAR was stored"), replaced.details());
+    assertFalse(replaced.details().contains("stays unloaded"), replaced.details());
+  }
+
+  @Test
+  void replaceJar_databaseUpdateFails_deletesNewJarKeepsOldJarAndAuditsFailure() throws Exception {
+    JobDefinitionEntity entity = createEntity(64L, "replace-db-failure-job", true, null);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-db-failure-job");
+    DataIntegrityViolationException failure = new DataIntegrityViolationException("db down");
+
+    when(jobDefinitionRepository.findById(64L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-db-failure-job"))
+        .thenReturn(Collections.emptySet());
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
+    // First save persists the unload; the second one is the replacement update.
+    when(jobDefinitionRepository.save(any(JobDefinitionEntity.class)))
+        .thenAnswer(invocation -> invocation.getArgument(0))
+        .thenThrow(failure);
+
+    DataIntegrityViolationException thrown =
+        assertThrows(
+            DataIntegrityViolationException.class,
+            () -> service.replaceJar(64L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+
+    assertSame(failure, thrown);
+    verify(transactionManager).rollback(any());
+    verify(transactionManager, never()).commit(any());
+    verify(jarUploadService, never()).autoApproveIfEnabled(any());
+    assertFalse(Files.exists(newJar.path()), "New JAR must be deleted when the update fails");
+    assertTrue(Files.exists(Path.of(validJarPath)), "Current JAR must be kept");
+
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.FAILURE, replaced.outcome());
+    assertEquals("replace-db-failure-job", replaced.jobName());
+    assertTrue(replaced.details().contains("id=64"), replaced.details());
+    assertTrue(replaced.details().contains("db down"), replaced.details());
+    assertTrue(replaced.details().contains(newJar.path().toString()), replaced.details());
+  }
+
+  @Test
+  void replaceJar_oldJarDeleteFails_stillSucceedsAndNamesOrphanJarInAudit() throws Exception {
+    // A non-empty directory cannot be removed by Files.deleteIfExists, which simulates an
+    // I/O failure on the previous JAR path after the update committed.
+    Path undeletable = tempDir.resolve("undeletable-old.jar");
+    Files.createDirectory(undeletable);
+    Files.createFile(undeletable.resolve("blocker"));
+    JobDefinitionEntity entity = createEntity(65L, "replace-orphan-job", true, null);
+    entity.setJarFilePath(undeletable.toString());
+    JarUploadService.StoredJar newJar = storedReplacement("replace-orphan-job");
+
+    when(jobDefinitionRepository.findById(65L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-orphan-job"))
+        .thenReturn(Collections.emptySet());
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
+    stubSaveReturnsArgument();
+
+    JobDefinitionEntity result =
+        assertDoesNotThrow(
+            () -> service.replaceJar(65L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+
+    assertEquals(newJar.path().toString(), result.getJarFilePath());
+    assertTrue(Files.exists(undeletable));
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, replaced.outcome());
+    assertTrue(replaced.details().contains("orphan"), replaced.details());
+    assertTrue(replaced.details().contains(undeletable.toString()), replaced.details());
+  }
+
+  @Test
+  void replaceJar_oldJarAlreadyMissing_succeeds() throws Exception {
+    JobDefinitionEntity entity = createEntity(66L, "replace-missing-job", true, null);
+    String missingJar = tempDir.resolve("already-gone.jar").toString();
+    entity.setJarFilePath(missingJar);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-missing-job");
+
+    when(jobDefinitionRepository.findById(66L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-missing-job"))
+        .thenReturn(Collections.emptySet());
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any())).thenReturn(newJar);
+    stubSaveReturnsArgument();
+
+    service.replaceJar(66L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS);
+
+    AuditEvent replaced = singleReplacedAuditEvent();
+    assertEquals(AuditEvent.SUCCESS, replaced.outcome());
+    assertTrue(replaced.details().contains("already absent"), replaced.details());
+  }
+
+  @Test
+  void replaceJar_nonexistentId_throwsNotFoundAndRetainsNoLock() throws Exception {
+    when(jobDefinitionRepository.findById(999L)).thenReturn(Optional.empty());
+
+    assertThrows(
+        NoSuchElementException.class,
+        () -> service.replaceJar(999L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+
+    assertTrue(lifecycleLocksOf(service).isEmpty());
+    verifyNoInteractions(pluginRegistryService, jarUploadService, transactionManager);
+  }
+
+  @Test
+  void replaceJar_holdsDefinitionLockWhileStoringAndUpdating() throws Exception {
+    JobDefinitionEntity entity = createEntity(67L, "replace-lock-job", true, LoadResult.LOADED);
+    JarUploadService.StoredJar newJar = storedReplacement("replace-lock-job");
+    when(jobDefinitionRepository.findById(67L)).thenReturn(Optional.of(entity));
+    when(jobRepository.findRunningJobExecutions("replace-lock-job"))
+        .thenReturn(Collections.emptySet());
+    stubSaveReturnsArgument();
+
+    AtomicInteger unregisterCalls = new AtomicInteger();
+    CountDownLatch secondUnregisterEntered = new CountDownLatch(1);
+    doAnswer(
+            invocation -> {
+              if (unregisterCalls.incrementAndGet() == 2) {
+                secondUnregisterEntered.countDown();
+              }
+              return null;
+            })
+        .when(pluginRegistryService)
+        .unregisterDynamicPlugin("replace-lock-job");
+
+    CountDownLatch storeEntered = new CountDownLatch(1);
+    CountDownLatch releaseStore = new CountDownLatch(1);
+    when(jarUploadService.storeReplacementJar(any(), any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              storeEntered.countDown();
+              assertTrue(releaseStore.await(5, TimeUnit.SECONDS));
+              return newJar;
+            });
+
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    try {
+      Future<?> replace =
+          pool.submit(() -> service.replaceJar(67L, replacementUpload, NEW_VERSION, NEW_MAIN_CLASS));
+      assertTrue(storeEntered.await(5, TimeUnit.SECONDS));
+
+      Future<?> concurrentUnload = pool.submit(() -> service.unloadJob(67L, true));
+      assertFalse(
+          secondUnregisterEntered.await(250, TimeUnit.MILLISECONDS),
+          "Concurrent unload must not enter while replace owns the lifecycle lock");
+
+      releaseStore.countDown();
+      replace.get(5, TimeUnit.SECONDS);
+      concurrentUnload.get(5, TimeUnit.SECONDS);
+      assertEquals(2, unregisterCalls.get());
+      assertTrue(lifecycleLocksOf(service).isEmpty());
+    } finally {
+      releaseStore.countDown();
       pool.shutdownNow();
     }
   }

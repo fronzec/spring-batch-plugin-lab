@@ -25,6 +25,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.SpringBootTest.WebEnvironment;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.annotation.DirtiesContext;
@@ -329,5 +330,78 @@ class PluginManagementIntegrationTest {
     assertThat(persisted.getApprovalStatus()).isEqualTo("APPROVED");
     assertThat(persisted.getApprovedBy()).isEqualTo("system");
     assertThat(persisted.getApprovedAt()).isNotNull();
+  }
+
+  // ─── JAR replacement ────────────────────────────────────────────────────────
+
+  @Test
+  @Order(13)
+  void replaceJarUnderNonProductionProfile_keepsIdAndReappliesAutoApproval() throws Exception {
+    String jobName = "replace-auto-approve-job";
+    String uploadBody =
+        mockMvc
+            .perform(
+                multipart(JOBS_BASE + "/upload")
+                    .file(testJar("replace-auto-approve.jar"))
+                    .param("jobName", jobName)
+                    .param("version", TEST_VERSION)
+                    .param("mainClassName", TEST_MAIN_CLASS))
+            .andExpect(status().isCreated())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    int idStart = uploadBody.indexOf("\"id\":") + 5;
+    int idEnd = uploadBody.indexOf(",", idStart);
+    long id = Long.parseLong(uploadBody.substring(idStart, idEnd).trim());
+    String oldJarPath = jobDefinitionRepository.findById(id).orElseThrow().getJarFilePath();
+
+    // The replacement must contain its main class entry.
+    MockMultipartFile replacement =
+        new MockMultipartFile(
+            "file",
+            "replace-auto-approve-1.1.0.jar",
+            MediaType.APPLICATION_OCTET_STREAM_VALUE,
+            createMinimalJarBytes(TEST_MAIN_CLASS.replace('.', '/') + ".class"));
+
+    mockMvc
+        .perform(
+            multipart(HttpMethod.PUT, JOBS_BASE + "/definitions/" + id + "/jar")
+                .file(replacement)
+                .param("version", "1.1.0")
+                .param("mainClassName", TEST_MAIN_CLASS))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.id").value(id))
+        .andExpect(jsonPath("$.version").value("1.1.0"))
+        // AutoApproveConfig is active under the test profile, so the reset PENDING approval
+        // is re-applied after commit, exactly as on upload.
+        .andExpect(jsonPath("$.approval_status").value("APPROVED"))
+        .andExpect(jsonPath("$.approved_by").value("system"));
+
+    JobDefinitionEntity persisted = jobDefinitionRepository.findById(id).orElseThrow();
+    assertThat(persisted.getApprovalStatus()).isEqualTo("APPROVED");
+    assertThat(persisted.getJarFilePath()).isNotEqualTo(oldJarPath);
+    assertThat(java.nio.file.Path.of(oldJarPath)).doesNotExist();
+    assertThat(java.nio.file.Path.of(persisted.getJarFilePath())).exists();
+  }
+
+  @Test
+  @Order(14)
+  void replaceJarWithoutMainClassEntry_returnsBadRequest() throws Exception {
+    JobDefinitionEntity existing =
+        jobDefinitionRepository.findByJobName("replace-auto-approve-job").orElseThrow();
+
+    mockMvc
+        .perform(
+            multipart(HttpMethod.PUT, JOBS_BASE + "/definitions/" + existing.getId() + "/jar")
+                .file(testJar("no-main-class.jar"))
+                .param("version", "1.2.0")
+                .param("mainClassName", TEST_MAIN_CLASS))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.status").value(400))
+        .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(TEST_MAIN_CLASS)));
+
+    JobDefinitionEntity after = jobDefinitionRepository.findById(existing.getId()).orElseThrow();
+    assertThat(after.getVersion()).isEqualTo("1.1.0");
+    assertThat(after.getJarFilePath()).isEqualTo(existing.getJarFilePath());
   }
 }

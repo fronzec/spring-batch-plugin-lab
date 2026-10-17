@@ -188,10 +188,14 @@ ______________________________________________________________________
      definition in one operation (running executions are not stopped; the JAR is deleted after the
      database commit, and an orphan JAR is logged and named in the `JOB_DELETED` audit)
   1. If DELETE returns `409` because the definition has execution history (`force=true` does not
-     bypass this), disable it with `PUT /jobs/definitions/{id}/disable` and unload it with
-     `POST /jobs/definitions/{id}/unload?force=true` instead. Note that a replacement upload with
-     the same job name is rejected as a duplicate while that definition exists.
-  1. Upload the previous working version
+     bypass this), keep the definition and replace its JAR in place instead:
+     `PUT /jobs/definitions/{id}/jar` with the previous working JAR (`file`, `version`,
+     `mainClassName`). It returns `409` while executions are running; wait for them to finish. The
+     definition keeps its ID and execution history, stays unloaded, and its approval is reset to
+     `PENDING`.
+  1. Approve it with `PUT /jobs/definitions/{id}/approve` and load it with
+     `POST /jobs/definitions/{id}/load`. After a successful DELETE, upload the previous working
+     version with `POST /jobs/upload` instead.
 - [ ] **Rollback tested**: A rollback drill has been completed within the RTO window.
 
 ______________________________________________________________________
