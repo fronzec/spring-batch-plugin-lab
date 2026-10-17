@@ -13,6 +13,7 @@ import com.fronzec.frbatchservice.web.dto.JarUploadResponse;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.CopyOption;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.Path;
@@ -371,7 +372,16 @@ public class JarUploadService {
 
         try {
             Files.copy(file.getInputStream(), target, options);
+        } catch (FileAlreadyExistsException e) {
+            // Nothing was written: the existing file belongs to someone else and must be kept.
+            throw new RuntimeException("Failed to store JAR at " + target, e);
         } catch (IOException e) {
+            // A copy that fails mid-stream can leave a partial file; remove it before propagating.
+            try {
+                Files.deleteIfExists(target);
+            } catch (IOException | SecurityException deleteEx) {
+                e.addSuppressed(deleteEx);
+            }
             throw new RuntimeException("Failed to store JAR at " + target, e);
         }
 

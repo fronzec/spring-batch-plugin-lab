@@ -24,11 +24,13 @@ import com.fronzec.frbatchservice.config.AutoApproveConfig;
 import com.fronzec.frbatchservice.web.dto.JarUploadResponse;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.stream.Stream;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
@@ -236,6 +238,64 @@ class JarUploadServiceTest {
     assertFalse(service.autoApproveIfEnabled(new JobDefinitionEntity()));
 
     verifyNoInteractions(jobDefinitionRepository);
+  }
+
+  @Test
+  @DisplayName("deletes a partially written replacement JAR when the copy fails mid-stream")
+  void storeReplacementJar_copyFailsMidStream_leavesNoPartialFile() throws IOException {
+    byte[] jarBytes = minimalJar();
+    MultipartFile failingFile = mock(MultipartFile.class);
+    when(failingFile.getOriginalFilename()).thenReturn("plugin.jar");
+    // Each stream yields the first bytes (enough for the header check) and then fails.
+    when(failingFile.getInputStream()).thenAnswer(invocation -> failingAfter(jarBytes, 16));
+
+    RuntimeException ex =
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                service.storeReplacementJar(
+                    failingFile, "test-job", "2.0.0", "com.example.MyPlugin"));
+
+    assertTrue(ex.getMessage().contains("Failed to store JAR"), ex.getMessage());
+    assertEquals(0, filesIn(jarDir), "no partial replacement JAR may remain");
+  }
+
+  @Test
+  @DisplayName("never deletes an existing file when the unique replacement name collides")
+  void storeReplacementJar_nameCollision_keepsExistingFile() throws IOException {
+    UUID fixed = UUID.fromString("abcdef12-0000-0000-0000-000000000000");
+    Path existing = jarDir.resolve("test-job-2.0.0-abcdef12.jar");
+    Files.write(existing, "someone-else".getBytes());
+
+    try (MockedStatic<UUID> uuid = mockStatic(UUID.class)) {
+      uuid.when(UUID::randomUUID).thenReturn(fixed);
+
+      assertThrows(
+          RuntimeException.class,
+          () ->
+              service.storeReplacementJar(
+                  replacementFile(minimalJar()), "test-job", "2.0.0", "com.example.MyPlugin"));
+    }
+
+    assertArrayEquals(
+        "someone-else".getBytes(),
+        Files.readAllBytes(existing),
+        "a colliding file that this call did not write must be kept");
+  }
+
+  /** Returns a stream that yields the first {@code limit} bytes and then throws. */
+  private static InputStream failingAfter(byte[] bytes, int limit) {
+    return new InputStream() {
+      private int position;
+
+      @Override
+      public int read() throws IOException {
+        if (position >= limit) {
+          throw new IOException("simulated stream failure");
+        }
+        return position < bytes.length ? bytes[position++] & 0xFF : -1;
+      }
+    };
   }
 
   private static MockMultipartFile replacementFile(byte[] jarBytes) {

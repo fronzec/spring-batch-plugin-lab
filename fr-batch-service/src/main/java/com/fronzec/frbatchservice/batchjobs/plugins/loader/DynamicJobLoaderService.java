@@ -615,8 +615,8 @@ public class DynamicJobLoaderService {
    * through {@link JarUploadService#storeReplacementJar} under a unique file name, so the current
    * JAR is never overwritten. One database transaction updates the JAR path, checksum, version,
    * and main class, resets the approval to {@code PENDING} (clearing the approver), and keeps the
-   * definition {@code UNLOADED}; {@code enabled} is unchanged. After commit, the non-production
-   * auto-approval is applied as on upload, and the previous JAR is deleted.
+   * definition {@code UNLOADED}; {@code enabled} is unchanged. After commit, the previous JAR is
+   * deleted and then the non-production auto-approval is applied as on upload.
    *
    * <p>A missing previous JAR is not an error. If it cannot be removed after commit, the
    * replacement still succeeds, a warning is logged, and the {@code JAR_REPLACED} success audit
