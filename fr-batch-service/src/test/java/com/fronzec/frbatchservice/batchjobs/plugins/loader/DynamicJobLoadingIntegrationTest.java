@@ -16,6 +16,7 @@ import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobDefinitionEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.entity.JobExecutionAuditEntity;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.util.ChecksumUtil;
 import com.fronzec.frbatchservice.restclients.ApiClient;
 import com.fronzec.frbatchservice.restclients.DataCalculatedResponse;
 import com.fronzec.frbatchservice.web.SingleJobDataRequest;
@@ -39,6 +40,7 @@ import org.springframework.batch.core.job.parameters.JobParametersBuilder;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.annotation.DirtiesContext;
@@ -51,7 +53,7 @@ import org.springframework.web.context.WebApplicationContext;
 
 /**
  * End-to-end integration tests for the dynamic job loading pipeline: upload, enable, load, unload,
- * reload, load-all, merged plugin listing, and job execution.
+ * reload, load-all, merged plugin listing, job execution, JAR replacement, and delete.
  *
  * <p>Uses a pre-compiled {@code DynamicTestPlugin} whose {@code .class} files are packaged into a
  * JAR at test-runtime and uploaded through the real {@code /jobs/upload} multipart endpoint.
@@ -77,11 +79,14 @@ class DynamicJobLoadingIntegrationTest {
   private static final String VERSION = "1.0.0";
   private static final String MAIN_CLASS = "com.fronzec.test.dynamic.DynamicTestPlugin";
   private static final String JAR_FILENAME = "dynamic-test-plugin.jar";
+  private static final String REPLACEMENT_VERSION = "2.0.0";
+  private static final String REPLACEMENT_JAR_FILENAME = "dynamic-test-plugin-replacement.jar";
 
   /* ── Static state (shared across @BeforeAll / @AfterAll / ordered tests) ── */
 
   private static Path tempDir;
   private static Path testJarPath;
+  private static Path replacementJarPath;
   static Long definitionId;
 
   /* ── Spring wiring ─────────────────────────────────────────────────────── */
@@ -104,6 +109,7 @@ class DynamicJobLoadingIntegrationTest {
   void createTestJar() throws Exception {
     tempDir = Files.createTempDirectory("dyn-load-test-");
     testJarPath = tempDir.resolve(JAR_FILENAME);
+    replacementJarPath = tempDir.resolve(REPLACEMENT_JAR_FILENAME);
 
     // Locate the pre-compiled DynamicTestPlugin.class on the test classpath
     String classResource = MAIN_CLASS.replace('.', '/') + ".class";
@@ -114,16 +120,29 @@ class DynamicJobLoadingIntegrationTest {
     // Walk up from the .class file to find the test-classes root
     Path classFile = Path.of(classUrl.toURI());
     Path packageDir = classFile.getParent(); // .../com/fronzec/test/dynamic/
-    // Compute the base directory by walking up to the package root
+    // Compute the base directory by walking up one level per package segment, so JAR entries
+    // are rooted at the package (com/fronzec/...) and the main class entry is resolvable.
     Path computed = packageDir;
-    for (int i = 0; i < MAIN_CLASS.split("\\.").length; i++) {
+    for (int i = 0; i < MAIN_CLASS.split("\\.").length - 1; i++) {
       computed = computed.getParent();
     }
     final Path baseDir = computed;
 
-    // Package all .class files from the package into a JAR
+    packagePluginJar(testJarPath, packageDir, baseDir, false);
+    // Same plugin classes plus a marker entry, so the replacement JAR has a different checksum.
+    packagePluginJar(replacementJarPath, packageDir, baseDir, true);
+  }
+
+  /** Packages all {@code .class} files under {@code packageDir} into a JAR at {@code target}. */
+  private static void packagePluginJar(
+      Path target, Path packageDir, Path baseDir, boolean withReplacementMarker) throws IOException {
     try (JarOutputStream jos =
-        new JarOutputStream(new BufferedOutputStream(new FileOutputStream(testJarPath.toFile())))) {
+        new JarOutputStream(new BufferedOutputStream(new FileOutputStream(target.toFile())))) {
+      if (withReplacementMarker) {
+        jos.putNextEntry(new JarEntry("META-INF/replacement-marker.txt"));
+        jos.write("replacement".getBytes());
+        jos.closeEntry();
+      }
       try (var files = Files.walk(packageDir)) {
         files
             .filter(p -> p.toString().endsWith(".class"))
@@ -177,11 +196,16 @@ class DynamicJobLoadingIntegrationTest {
         // best-effort cleanup
       }
     }
-    // Clean up uploaded JAR in the plugin storage directory
-    try {
-      Files.deleteIfExists(Path.of("./target/test-plugins/jars/" + JOB_NAME + "-" + VERSION + ".jar"));
-    } catch (IOException ignored) {
-      // best-effort cleanup
+    // Clean up uploaded and replacement JARs in the plugin storage directory
+    Path jarDir = Path.of("./target/test-plugins/jars/");
+    if (Files.isDirectory(jarDir)) {
+      try (DirectoryStream<Path> jars = Files.newDirectoryStream(jarDir, JOB_NAME + "-*.jar")) {
+        for (Path jar : jars) {
+          Files.deleteIfExists(jar);
+        }
+      } catch (IOException ignored) {
+        // best-effort cleanup
+      }
     }
   }
 
@@ -198,6 +222,14 @@ class DynamicJobLoadingIntegrationTest {
         JAR_FILENAME,
         MediaType.APPLICATION_OCTET_STREAM_VALUE,
         Files.readAllBytes(testJarPath));
+  }
+
+  private MockMultipartFile replacementJar() throws IOException {
+    return new MockMultipartFile(
+        "file",
+        REPLACEMENT_JAR_FILENAME,
+        MediaType.APPLICATION_OCTET_STREAM_VALUE,
+        Files.readAllBytes(replacementJarPath));
   }
 
   /* ── Helpers: execution audit lookups ──────────────────────────────────── */
@@ -537,10 +569,116 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
   }
 
-  /* ── 16. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */
+  /* ── 16. Replace the JAR of a definition with history → 200, same id ──── */
 
   @Test
   @Order(16)
+  void replaceJarWithExecutionHistory_keepsIdAndHistory_thenReapprovedLoadUsesNewJar()
+      throws Exception {
+    // Tests 11 and 12 left execution history; replacement must keep it linked to the same id.
+    List<JobExecutionAuditEntity> historyBefore =
+        jobExecutionAuditRepository.findByJobDefinitionId(definitionId);
+    assertThat(historyBefore).isNotEmpty();
+    JobDefinitionEntity before = jobDefinitionRepository.findById(definitionId).orElseThrow();
+    Path oldJar = Path.of(before.getJarFilePath());
+    assertThat(oldJar).exists();
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+
+    mockMvc
+        .perform(
+            multipart(HttpMethod.PUT, JOBS_BASE + "/definitions/" + definitionId + "/jar")
+                .file(replacementJar())
+                .param("version", REPLACEMENT_VERSION)
+                .param("mainClassName", MAIN_CLASS))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.id").value(definitionId))
+        .andExpect(jsonPath("$.job_name").value(JOB_NAME))
+        .andExpect(jsonPath("$.version").value(REPLACEMENT_VERSION))
+        .andExpect(
+            jsonPath("$.jar_file_name")
+                .value(containsString(JOB_NAME + "-" + REPLACEMENT_VERSION + "-")))
+        // Auto-approval is disabled in this suite, so the replacement needs a fresh approval.
+        .andExpect(jsonPath("$.approval_status").value("PENDING"))
+        .andExpect(jsonPath("$.approved_by").doesNotExist())
+        .andExpect(jsonPath("$.load_status").value(LoadResult.UNLOADED))
+        .andExpect(jsonPath("$.enabled").value(true));
+
+    JobDefinitionEntity after = jobDefinitionRepository.findById(definitionId).orElseThrow();
+    Path newJar = Path.of(after.getJarFilePath());
+    assertThat(newJar).exists().isNotEqualTo(oldJar);
+    assertThat(oldJar).doesNotExist();
+    assertThat(after.getJarChecksum())
+        .isNotEqualTo(before.getJarChecksum())
+        .isEqualTo(ChecksumUtil.computeSha256(newJar));
+    assertThat(pluginRegistryService.getRegisteredJobNames()).doesNotContain(JOB_NAME);
+    assertThat(jobExecutionAuditRepository.findByJobDefinitionId(definitionId))
+        .hasSameSizeAs(historyBefore);
+
+    // Loading is blocked until the replacement is approved, then uses the new JAR.
+    mockMvc
+        .perform(post(JOBS_BASE + "/definitions/" + definitionId + "/load"))
+        .andExpect(status().isConflict())
+        .andExpect(jsonPath("$.message").value(containsString("must be approved")));
+    mockMvc
+        .perform(put(JOBS_BASE + "/definitions/" + definitionId + "/approve"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.approval_status").value("APPROVED"));
+    mockMvc
+        .perform(post(JOBS_BASE + "/definitions/" + definitionId + "/load"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.status").value(LoadResult.LOADED));
+    assertThat(pluginRegistryService.getRegisteredJobNames()).contains(JOB_NAME);
+  }
+
+  /* ── 17. Replace the JAR of an unknown definition → 404 ───────────────── */
+
+  @Test
+  @Order(17)
+  void replaceJarOfNonExistentDefinition_returnsNotFound() throws Exception {
+    mockMvc
+        .perform(
+            multipart(HttpMethod.PUT, JOBS_BASE + "/definitions/99999/jar")
+                .file(replacementJar())
+                .param("version", REPLACEMENT_VERSION)
+                .param("mainClassName", MAIN_CLASS))
+        .andExpect(status().isNotFound())
+        .andExpect(jsonPath("$.status").value(404))
+        .andExpect(jsonPath("$.error").value("Not Found"));
+  }
+
+  /* ── 18. Replace with an invalid JAR → 400, definition and JAR kept ───── */
+
+  @Test
+  @Order(18)
+  void replaceJarWithInvalidJar_returnsBadRequest_andKeepsDefinitionAndJar() throws Exception {
+    JobDefinitionEntity before = jobDefinitionRepository.findById(definitionId).orElseThrow();
+    MockMultipartFile notAJar =
+        new MockMultipartFile(
+            "file", "broken.jar", MediaType.APPLICATION_OCTET_STREAM_VALUE, "not a jar".getBytes());
+
+    mockMvc
+        .perform(
+            multipart(HttpMethod.PUT, JOBS_BASE + "/definitions/" + definitionId + "/jar")
+                .file(notAJar)
+                .param("version", "3.0.0")
+                .param("mainClassName", MAIN_CLASS))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.status").value(400));
+
+    JobDefinitionEntity after = jobDefinitionRepository.findById(definitionId).orElseThrow();
+    assertThat(after.getJarFilePath()).isEqualTo(before.getJarFilePath());
+    assertThat(after.getJarChecksum()).isEqualTo(before.getJarChecksum());
+    assertThat(after.getVersion()).isEqualTo(REPLACEMENT_VERSION);
+    assertThat(after.getApprovalStatus()).isEqualTo("APPROVED");
+    assertThat(Path.of(after.getJarFilePath())).exists();
+    // The replace unloads before validating, so a rejected JAR leaves the definition unloaded.
+    assertThat(pluginRegistryService.getRegisteredJobNames()).doesNotContain(JOB_NAME);
+  }
+
+  /* ── 19. DELETE a loaded plugin → 204, unregistered, row and JAR removed ── */
+
+  @Test
+  @Order(19)
   void deleteLoadedPlugin_returnsNoContent_andUnregistersJob() throws Exception {
     // Remove the execution history that blocked test 15 so this test isolates the
     // lifecycle behaviour of deleting a loaded plugin.
@@ -563,10 +701,10 @@ class DynamicJobLoadingIntegrationTest {
     assertThat(storedJar).doesNotExist();
   }
 
-  /* ── 17. DELETE an unknown definition → 404 error envelope ────────────── */
+  /* ── 20. DELETE an unknown definition → 404 error envelope ────────────── */
 
   @Test
-  @Order(17)
+  @Order(20)
   void deleteNonExistentDefinition_returnsNotFound() throws Exception {
     mockMvc
         .perform(delete(JOBS_BASE + "/definitions/99999"))

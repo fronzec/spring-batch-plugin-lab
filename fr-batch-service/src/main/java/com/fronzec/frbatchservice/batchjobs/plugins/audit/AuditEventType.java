@@ -5,10 +5,11 @@ package com.fronzec.frbatchservice.batchjobs.plugins.audit;
  * Lifecycle event types tracked by the audit trail.
  *
  * <p>Every event maps to a specific operation in the plugin lifecycle:
- * upload → approve/reject → load → (run) → unload → delete.
+ * upload → approve/reject → load → (run) → unload → replace JAR → delete.
  */
 public enum AuditEventType {
   JAR_UPLOADED,
+  JAR_REPLACED,
   JOB_LOADED,
   JOB_UNLOADED,
   JOB_DELETED,

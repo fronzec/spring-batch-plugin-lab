@@ -11,6 +11,9 @@ import com.fronzec.frbatchservice.batchjobs.plugins.metrics.PluginMetrics;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobDefinitionRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobExecutionAuditRepository;
 import com.fronzec.frbatchservice.batchjobs.plugins.repository.JobParameterTemplateRepository;
+import com.fronzec.frbatchservice.batchjobs.plugins.service.InvalidJarException;
+import com.fronzec.frbatchservice.batchjobs.plugins.service.JarUploadService;
+import com.fronzec.frbatchservice.batchjobs.plugins.service.JarUploadService.StoredJar;
 import com.fronzec.frbatchservice.batchjobs.plugins.util.ChecksumUtil;
 import java.io.File;
 import java.io.IOException;
@@ -35,10 +38,11 @@ import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.web.multipart.MultipartFile;
 
 /**
  * Orchestrates the full lifecycle of dynamically-loaded batch job plugins: load from JAR,
- * instantiate, configure, register, unload, and delete.
+ * instantiate, configure, register, unload, replace the JAR, and delete.
  *
  * <p>Owns the {@link DynamicJobClassLoader} lifecycle via a {@link ConcurrentHashMap} keyed by
  * definition ID. Delegates registry operations to {@link PluginRegistryService}.
@@ -57,9 +61,13 @@ public class DynamicJobLoaderService {
   private final PluginMetrics pluginMetrics;
   private final JobParameterTemplateRepository jobParameterTemplateRepository;
   private final JobExecutionAuditRepository jobExecutionAuditRepository;
+  private final JarUploadService jarUploadService;
 
-  /** Runs the database part of {@link #deleteJob} (templates + definition) as one transaction. */
-  private final TransactionTemplate deleteTransaction;
+  /**
+   * Runs the database part of {@link #deleteJob} (templates + definition) and of {@link
+   * #replaceJar} (definition update), each as one transaction.
+   */
+  private final TransactionTemplate lifecycleTransaction;
 
   /** Tracks active classloaders by definition ID for cleanup on unload. */
   private final Map<Long, DynamicJobClassLoader> classLoaders = new ConcurrentHashMap<>();
@@ -82,7 +90,8 @@ public class DynamicJobLoaderService {
       AuditService auditService,
       PluginMetrics pluginMetrics,
       JobParameterTemplateRepository jobParameterTemplateRepository,
-      JobExecutionAuditRepository jobExecutionAuditRepository) {
+      JobExecutionAuditRepository jobExecutionAuditRepository,
+      JarUploadService jarUploadService) {
     this.jobDefinitionRepository = jobDefinitionRepository;
     this.pluginRegistryService = pluginRegistryService;
     this.applicationContext = applicationContext;
@@ -92,7 +101,8 @@ public class DynamicJobLoaderService {
     this.pluginMetrics = pluginMetrics;
     this.jobParameterTemplateRepository = jobParameterTemplateRepository;
     this.jobExecutionAuditRepository = jobExecutionAuditRepository;
-    this.deleteTransaction = new TransactionTemplate(transactionManager);
+    this.jarUploadService = jarUploadService;
+    this.lifecycleTransaction = new TransactionTemplate(transactionManager);
   }
 
   /**
@@ -517,7 +527,7 @@ public class DynamicJobLoaderService {
       unloaded = true;
       // doUnloadJob persisted the entity as UNLOADED, so delete by id inside the transaction
       // instead of deleting the now-stale instance read above.
-      deleteTransaction.executeWithoutResult(
+      lifecycleTransaction.executeWithoutResult(
           status -> {
             jobParameterTemplateRepository.deleteByJobDefinitionId(definitionId);
             jobDefinitionRepository.deleteById(definitionId);
@@ -566,8 +576,9 @@ public class DynamicJobLoaderService {
   }
 
   /**
-   * Removes the JAR file after the delete transaction committed. File-system problems never fail
-   * the delete: the definition is already gone, so the JAR is reported as an orphan instead.
+   * Removes a JAR file that no definition references any more, after the delete or replace
+   * transaction committed. File-system problems never fail the operation: the database change is
+   * already committed, so the JAR is reported as an orphan instead.
    *
    * @return a human-readable JAR outcome for the success audit detail
    */
@@ -585,12 +596,222 @@ public class DynamicJobLoaderService {
       return "JAR already absent: " + jarFilePath;
     } catch (IOException | InvalidPathException | SecurityException e) {
       log.warn(
-          "Job definition id={} deleted but its JAR could not be removed; orphan JAR left on"
-              + " disk: {} ({})",
+          "Job definition id={} committed but its unreferenced JAR could not be removed; orphan"
+              + " JAR left on disk: {} ({})",
           definitionId,
           jarFilePath,
           e.toString());
       return "orphan JAR left on disk: " + jarFilePath + " (" + e + ")";
+    }
+  }
+
+  /**
+   * Replaces the JAR of an existing job definition in place, keeping its ID so execution history
+   * and parameter templates stay linked.
+   *
+   * <p>The whole operation runs under the per-definition lifecycle lock. It first unloads the
+   * plugin without force, so running executions reject the replacement with {@link
+   * JobUnloadConflictException} and nothing changes. It then validates and stores the new JAR
+   * through {@link JarUploadService#storeReplacementJar} under a unique file name, so the current
+   * JAR is never overwritten. One database transaction updates the JAR path, checksum, version,
+   * and main class, resets the approval to {@code PENDING} (clearing the approver), and keeps the
+   * definition {@code UNLOADED}; {@code enabled} is unchanged. After commit, the non-production
+   * auto-approval is applied as on upload, and the previous JAR is deleted.
+   *
+   * <p>A missing previous JAR is not an error. If it cannot be removed after commit, the
+   * replacement still succeeds, a warning is logged, and the {@code JAR_REPLACED} success audit
+   * names the orphan JAR path. Any failure before or at commit deletes the newly stored JAR (best
+   * effort), emits a {@code JAR_REPLACED} failure audit, and propagates the original exception;
+   * the definition keeps its previous JAR and metadata but stays unloaded when the failure
+   * happened after the unload.
+   *
+   * @param definitionId the database ID of the job definition whose JAR is replaced
+   * @param file the replacement JAR
+   * @param version the version of the replacement
+   * @param mainClassName fully-qualified class name of the {@code BatchJobPlugin} implementation
+   * @return the updated definition
+   * @throws NoSuchElementException if the definition does not exist
+   * @throws JobUnloadConflictException if the job has running executions; nothing is changed
+   * @throws InvalidJarException if the replacement JAR fails validation; the definition is kept
+   * @throws org.springframework.dao.DataAccessException if the database update fails; the
+   *     transaction is rolled back, the new JAR is deleted, and the previous JAR is kept
+   */
+  public JobDefinitionEntity replaceJar(
+      Long definitionId, MultipartFile file, String version, String mainClassName) {
+    if (jobDefinitionRepository.findById(definitionId).isEmpty()) {
+      throw new NoSuchElementException("Job definition not found for id: " + definitionId);
+    }
+    return withDefinitionLock(
+        definitionId, () -> doReplaceJar(definitionId, file, version, mainClassName));
+  }
+
+  /** Performs the actual replacement while the caller owns the per-definition lifecycle lock. */
+  private JobDefinitionEntity doReplaceJar(
+      Long definitionId, MultipartFile file, String version, String mainClassName) {
+    JobDefinitionEntity entity =
+        jobDefinitionRepository
+            .findById(definitionId)
+            .orElseThrow(
+                () ->
+                    new NoSuchElementException(
+                        "Job definition not found for id: " + definitionId));
+    String jobName = entity.getJobName();
+    String previousJarPath = entity.getJarFilePath();
+    String previousVersion = entity.getVersion();
+
+    boolean unloaded = false;
+    StoredJar storedJar = null;
+    JobDefinitionEntity updated;
+    try {
+      doUnloadJob(definitionId, false);
+      unloaded = true;
+      storedJar = jarUploadService.storeReplacementJar(file, jobName, version, mainClassName);
+      StoredJar newJar = storedJar;
+      updated =
+          lifecycleTransaction.execute(
+              status -> applyReplacement(definitionId, newJar, version, mainClassName));
+    } catch (RuntimeException e) {
+      String outcome;
+      if (!unloaded) {
+        outcome = "Nothing was changed.";
+      } else {
+        String newJarOutcome =
+            storedJar == null ? "no new JAR was stored" : discardStoredJar(storedJar.path(), e);
+        outcome =
+            "The plugin was unloaded and stays unloaded; the definition and its current JAR "
+                + previousJarPath
+                + " were kept; "
+                + newJarOutcome
+                + ".";
+      }
+      log.error(
+          "Failed to replace JAR of job definition id={} jobName='{}' version={}: {}",
+          definitionId,
+          jobName,
+          version,
+          e.getMessage(),
+          e);
+      auditService.logEvent(
+          new AuditEvent(
+              AuditEventType.JAR_REPLACED,
+              jobName,
+              AuditService.currentUserId(),
+              "Replace JAR failed for job definition id="
+                  + definitionId
+                  + " (version "
+                  + version
+                  + "): "
+                  + e.getMessage()
+                  + ". "
+                  + outcome,
+              AuditEvent.FAILURE,
+              LocalDateTime.now()));
+      throw e;
+    }
+
+    String previousJarOutcome =
+        storedJar.path().toString().equals(previousJarPath)
+            ? "previous JAR path unchanged"
+            : deleteJarAfterCommit(definitionId, previousJarPath);
+    String approvalOutcome = autoApproveAfterCommit(updated);
+    log.info(
+        "JAR replaced: id={}, jobName='{}', version {} -> {}, jar={}, {}; previous {}",
+        definitionId,
+        jobName,
+        previousVersion,
+        version,
+        updated.getJarFilePath(),
+        approvalOutcome,
+        previousJarOutcome);
+    auditService.logEvent(
+        new AuditEvent(
+            AuditEventType.JAR_REPLACED,
+            jobName,
+            AuditService.currentUserId(),
+            "JAR replaced for job definition id="
+                + definitionId
+                + ": version "
+                + previousVersion
+                + " -> "
+                + version
+                + ", jar "
+                + updated.getJarFilePath()
+                + " (checksum "
+                + updated.getJarChecksum()
+                + "), "
+                + approvalOutcome
+                + "; previous "
+                + previousJarOutcome,
+            AuditEvent.SUCCESS,
+            LocalDateTime.now()));
+    return updated;
+  }
+
+  /**
+   * Points the definition at the replacement JAR and resets its approval. Runs inside the replace
+   * transaction; re-reads the definition because {@link #doUnloadJob} already saved it.
+   */
+  private JobDefinitionEntity applyReplacement(
+      Long definitionId, StoredJar newJar, String version, String mainClassName) {
+    JobDefinitionEntity current =
+        jobDefinitionRepository
+            .findById(definitionId)
+            .orElseThrow(
+                () ->
+                    new NoSuchElementException(
+                        "Job definition not found for id: " + definitionId));
+    current.setJarFilePath(newJar.path().toString());
+    current.setJarChecksum(newJar.checksum());
+    current.setVersion(version);
+    current.setMainClassName(mainClassName);
+    current.setApprovalStatus("PENDING");
+    current.setApprovedBy(null);
+    current.setApprovedAt(null);
+    current.setLoadStatus(LoadResult.UNLOADED);
+    current.setLoadError(null);
+    return jobDefinitionRepository.save(current);
+  }
+
+  /**
+   * Applies the non-production auto-approval after the replace transaction committed. A failure
+   * does not fail the replacement: the definition keeps its committed {@code PENDING} approval.
+   *
+   * @return a human-readable approval outcome for the success audit detail
+   */
+  private String autoApproveAfterCommit(JobDefinitionEntity updated) {
+    try {
+      return jarUploadService.autoApproveIfEnabled(updated)
+          ? "auto-approved (non-production)"
+          : "approval reset to PENDING";
+    } catch (RuntimeException e) {
+      // The in-memory entity may already carry the approval; mirror the committed state.
+      updated.setApprovalStatus("PENDING");
+      updated.setApprovedBy(null);
+      updated.setApprovedAt(null);
+      log.warn(
+          "Job definition id={} JAR replaced but auto-approval failed; approval stays PENDING: {}",
+          updated.getId(),
+          e.toString());
+      return "auto-approval failed, approval stays PENDING (" + e + ")";
+    }
+  }
+
+  /**
+   * Deletes a replacement JAR that was stored but never committed as the definition's JAR.
+   *
+   * @return a human-readable outcome for the failure audit detail
+   */
+  private String discardStoredJar(Path storedJar, RuntimeException failure) {
+    try {
+      Files.deleteIfExists(storedJar);
+      return "the new JAR " + storedJar + " was deleted";
+    } catch (IOException | SecurityException e) {
+      failure.addSuppressed(e);
+      log.warn(
+          "Could not delete uncommitted replacement JAR; orphan JAR left on disk: {} ({})",
+          storedJar,
+          e.toString());
+      return "the new JAR could not be deleted; orphan JAR left on disk: " + storedJar;
     }
   }
 

@@ -47,6 +47,7 @@ import org.springframework.web.multipart.MultipartFile;
  *   <li>{@code GET  /definitions/{id}} — get single definition</li>
  *   <li>{@code PUT  /definitions/{id}/enable} — enable a definition</li>
  *   <li>{@code PUT  /definitions/{id}/disable} — disable a definition</li>
+ *   <li>{@code PUT  /definitions/{id}/jar} — replace the JAR in place (same id, re-approval)</li>
  *   <li>{@code DELETE /definitions/{id}[?force=true]} — unload, delete DB rows, then remove JAR</li>
  *   <li>{@code POST /definitions/{id}/load} — load plugin from JAR into registry</li>
  *   <li>{@code POST /definitions/{id}/unload} — unregister plugin and close classloader</li>
@@ -295,6 +296,40 @@ public class JobManagementController {
                 LocalDateTime.now()));
 
         return ResponseEntity.ok(JobDefinitionResponse.fromEntity(saved));
+    }
+
+    // ─── JAR replacement ───────────────────────────────────────────────────────
+
+    /**
+     * Replaces the JAR of an existing job definition in place, delegated to
+     * {@link DynamicJobLoaderService#replaceJar}. The definition keeps its ID, so its
+     * execution history and parameter templates stay linked.
+     *
+     * <p>The plugin is unloaded first, the new JAR is validated like an upload and stored
+     * under a unique file name, and one transaction updates the JAR path, checksum,
+     * version, and main class and resets the approval to {@code PENDING} (non-production
+     * profiles re-apply auto-approval). The definition stays unloaded and must be approved
+     * and loaded again. The previous JAR is deleted after commit.
+     *
+     * <p>Returns {@code 200 OK} with the updated definition, {@code 404 Not Found} if the
+     * definition does not exist, {@code 409 Conflict} if the job has running executions
+     * (nothing is changed), and {@code 400 Bad Request} if the JAR fails validation (the
+     * definition keeps its JAR but stays unloaded).
+     *
+     * @param id            the job definition ID
+     * @param file          the replacement JAR
+     * @param version       the version of the replacement
+     * @param mainClassName fully-qualified class name of the {@code BatchJobPlugin} impl
+     * @return {@code 200 OK} with the updated definition
+     */
+    @PutMapping("/definitions/{id}/jar")
+    public ResponseEntity<JobDefinitionResponse> replaceJar(
+            @PathVariable long id,
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("version") String version,
+            @RequestParam("mainClassName") String mainClassName) {
+        JobDefinitionEntity updated = loaderService.replaceJar(id, file, version, mainClassName);
+        return ResponseEntity.ok(JobDefinitionResponse.fromEntity(updated));
     }
 
     // ─── CRUD: delete ──────────────────────────────────────────────────────────

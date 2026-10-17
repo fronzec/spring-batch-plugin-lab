@@ -182,6 +182,7 @@ Roles below).
 | `GET`    | `/jobs/definitions/{id}`              | `PLUGIN_VIEWER`+ | Get a single definition                                                 |
 | `PUT`    | `/jobs/definitions/{id}/enable`       | `PLUGIN_ADMIN`   | Enable a definition                                                     |
 | `PUT`    | `/jobs/definitions/{id}/disable`      | `PLUGIN_ADMIN`   | Disable a definition                                                    |
+| `PUT`    | `/jobs/definitions/{id}/jar`          | `PLUGIN_ADMIN`   | Replace the JAR in place (see [Replace JAR](#replace-jar))              |
 | `DELETE` | `/jobs/definitions/{id}[?force=true]` | `PLUGIN_ADMIN`   | Unload, delete definition, then delete JAR file (see [Delete](#delete)) |
 | `GET`    | `/jobs/plugins`                       | Public           | List merged plugin metadata                                             |
 
@@ -295,6 +296,50 @@ curl -u admin:admin123 -X DELETE \
 # Delete even if executions are running (they are not stopped)
 curl -u admin:admin123 -X DELETE \
   "http://localhost:8080/api/batch-service/jobs/definitions/1?force=true"
+```
+
+### Replace JAR
+
+`PUT /jobs/definitions/{id}/jar` replaces the JAR of an existing definition in place, for example to
+roll back to a previous working version. The definition keeps its ID, so its execution history and
+parameter templates stay linked. It is a multipart request with the same fields as an upload except
+`jobName`, which cannot change: `file`, `version`, and `mainClassName`.
+
+The operation runs under the same per-definition lock as load, unload, reload, and delete:
+
+1. The plugin is unloaded first, without force. Running executions reject the replacement and
+   nothing changes.
+1. The new JAR is validated like an upload (`.jar` extension, ZIP magic bytes, fully-qualified main
+   class name, signature policy) and must contain the main class entry. No plugin code runs at this
+   point. It is stored under a unique file name (`{jobName}-{version}-{random}.jar`), so the current
+   JAR is never overwritten.
+1. One database transaction updates the JAR path, checksum, version, and main class, and resets the
+   approval to `PENDING`. The definition stays `UNLOADED`; `enabled` is unchanged. In non-production
+   profiles the auto-approval is applied again after commit, as on upload.
+1. The previous JAR is deleted after that transaction commits.
+
+After a successful replacement, approve the definition (unless it was auto-approved) and load it
+again. Loading still checks that the plugin's job name matches the definition.
+
+| Outcome               | Response                                                                 |
+| --------------------- | ------------------------------------------------------------------------ |
+| Replaced              | `200 OK` with the updated definition                                     |
+| Unknown ID            | `404 Not Found`                                                          |
+| Running executions    | `409 Conflict`; nothing is unloaded or changed                           |
+| Invalid JAR           | `400 Bad Request`; the definition keeps its JAR but stays unloaded       |
+| Database update fails | Error response; rolled back, new JAR deleted, current JAR kept, unloaded |
+
+A missing previous JAR does not fail the request. If the previous JAR cannot be removed after
+commit, the request still returns `200`, a `WARN` is logged, and the `JAR_REPLACED` success audit
+names the orphan JAR path. `JAR_REPLACED` is audited `SUCCESS` only after the whole operation;
+otherwise it is audited `FAILURE` with the definition ID, the reason, and what was kept.
+
+```bash
+curl -u admin:admin123 -X PUT \
+  -F "file=@target/example-payment-job-1.0.0.jar" \
+  -F "version=1.0.0" \
+  -F "mainClassName=com.example.payment.PaymentJobPlugin" \
+  http://localhost:8080/api/batch-service/jobs/definitions/1/jar
 ```
 
 ### Job Execution
