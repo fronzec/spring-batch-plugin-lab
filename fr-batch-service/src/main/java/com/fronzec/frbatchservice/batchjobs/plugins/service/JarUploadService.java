@@ -12,10 +12,8 @@ import com.fronzec.frbatchservice.config.AutoApproveConfig;
 import com.fronzec.frbatchservice.web.dto.JarUploadResponse;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.CopyOption;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.util.Arrays;
@@ -99,6 +97,12 @@ public class JarUploadService {
     /**
      * Validates, stores, and registers a new JAR plugin.
      *
+     * <p>The JAR is stored under a unique file name, {@code {jarDir}/{jobName}-{version}-{random}.jar},
+     * without replacing any existing file, so a concurrent upload can never overwrite a JAR that
+     * another definition references. If a check fails after the file was stored, or the database
+     * unique key rejects the definition as a duplicate, the file this call stored is deleted. Any
+     * other failure while saving the definition has an unknown outcome, so the file is kept.
+     *
      * @param file          the uploaded JAR file
      * @param jobName       unique job name for the definition
      * @param version       semantic version string
@@ -118,15 +122,37 @@ public class JarUploadService {
 
         checkDuplicate(jobName);
 
-    Path storedPath = storeFile(file, jobName, version);
+    Path storedPath = storeUniqueFile(file, jobName, version);
 
-    // Compute the checksum from the persisted file (not the multipart stream) so the
-    // stored digest matches the bytes that load-time integrity verification re-checks.
-    String checksum = ChecksumUtil.computeSha256(storedPath);
+    String checksum;
+    try {
+        // Compute the checksum from the persisted file (not the multipart stream) so the
+        // stored digest matches the bytes that load-time integrity verification re-checks.
+        checksum = ChecksumUtil.computeSha256(storedPath);
 
-    verifySignature(storedPath);
+        verifySignature(storedPath);
+    } catch (RuntimeException e) {
+        // No definition references the file this call stored, so it must not stay on disk.
+        deleteRejectedJar(storedPath, e);
+        throw e;
+    }
 
-    JobDefinitionEntity entity = persistMetadata(jobName, version, mainClassName, checksum, storedPath);
+    JobDefinitionEntity entity;
+    try {
+        entity = persistMetadata(jobName, version, mainClassName, checksum, storedPath);
+    } catch (DuplicateJobDefinitionException e) {
+        // The unique key rejected the insert, so no definition references this file.
+        deleteRejectedJar(storedPath, e);
+        throw e;
+    } catch (RuntimeException e) {
+        // The insert may have committed before the failure surfaced, so the file is kept.
+        log.warn(
+                "Saving definition '{}' failed with an unknown outcome; keeping its JAR, possibly"
+                        + " as an orphan: {}",
+                jobName,
+                storedPath);
+        throw e;
+    }
 
         pluginMetrics.incrementUpload();
 
@@ -186,9 +212,7 @@ public class JarUploadService {
         validateJar(file);
         validateMainClassName(mainClassName);
 
-        String uniqueSuffix = "-" + UUID.randomUUID().toString().substring(0, 8);
-        // No REPLACE_EXISTING: a name collision fails instead of overwriting a stored JAR.
-        Path storedPath = storeFile(file, jobName, version, uniqueSuffix);
+        Path storedPath = storeUniqueFile(file, jobName, version);
         try {
             requireMainClassEntry(storedPath, mainClassName);
             String checksum = ChecksumUtil.computeSha256(storedPath);
@@ -196,13 +220,22 @@ public class JarUploadService {
             log.debug("Replacement JAR stored at {} (checksum={})", storedPath, checksum);
             return new StoredJar(storedPath, checksum);
         } catch (RuntimeException e) {
-            try {
-                Files.deleteIfExists(storedPath);
-            } catch (IOException deleteEx) {
-                e.addSuppressed(deleteEx);
-                log.warn("Could not delete rejected replacement JAR {}: {}", storedPath, deleteEx.toString());
-            }
+            deleteRejectedJar(storedPath, e);
             throw e;
+        }
+    }
+
+    /**
+     * Deletes a JAR this service stored but no definition references. A failed delete is attached
+     * to {@code cause} as a suppressed exception and logged, so {@code cause} stays the reported
+     * failure.
+     */
+    private static void deleteRejectedJar(Path storedPath, RuntimeException cause) {
+        try {
+            Files.deleteIfExists(storedPath);
+        } catch (IOException | SecurityException deleteEx) {
+            cause.addSuppressed(deleteEx);
+            log.warn("Could not delete rejected JAR {}: {}", storedPath, deleteEx.toString());
         }
     }
 
@@ -339,17 +372,13 @@ public class JarUploadService {
 
     // ─── file storage ──────────────────────────────────────────────────────────
 
-    /** Stores the JAR to {@code {jarDir}/{jobName}-{version}.jar}, replacing an existing file. */
-    private Path storeFile(MultipartFile file, String jobName, String version) {
-        return storeFile(file, jobName, version, "", StandardCopyOption.REPLACE_EXISTING);
-    }
-
     /**
-     * Stores the JAR to {@code {jarDir}/{jobName}-{version}{suffix}.jar} with the given copy
-     * options; without {@code REPLACE_EXISTING} an existing file makes the copy fail.
+     * Stores the JAR to {@code {jarDir}/{jobName}-{version}-{random}.jar}. The file is created
+     * without replacing an existing one: a name collision fails and leaves the existing file
+     * untouched.
      */
-    private Path storeFile(
-            MultipartFile file, String jobName, String version, String suffix, CopyOption... options) {
+    private Path storeUniqueFile(MultipartFile file, String jobName, String version) {
+        String suffix = "-" + UUID.randomUUID().toString().substring(0, 8);
         String safeJobName = sanitizeNameComponent(jobName);
         String safeVersion = sanitizeNameComponent(version);
 
@@ -371,7 +400,8 @@ public class JarUploadService {
         }
 
         try {
-            Files.copy(file.getInputStream(), target, options);
+            // No REPLACE_EXISTING: a name collision fails instead of overwriting a stored JAR.
+            Files.copy(file.getInputStream(), target);
         } catch (FileAlreadyExistsException e) {
             // Nothing was written: the existing file belongs to someone else and must be kept.
             throw new RuntimeException("Failed to store JAR at " + target, e);
