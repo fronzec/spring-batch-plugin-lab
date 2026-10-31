@@ -288,7 +288,8 @@ class DynamicJobLoadingIntegrationTest {
             .andExpect(jsonPath("$.id").isNumber())
             .andExpect(jsonPath("$.job_name").value(JOB_NAME))
             .andExpect(jsonPath("$.version").value(VERSION))
-            .andExpect(jsonPath("$.jar_file_name").value(JOB_NAME + "-" + VERSION + ".jar"))
+            .andExpect(
+                jsonPath("$.jar_file_name").value(containsString(JOB_NAME + "-" + VERSION + "-")))
             .andReturn()
             .getResponse()
             .getContentAsString();

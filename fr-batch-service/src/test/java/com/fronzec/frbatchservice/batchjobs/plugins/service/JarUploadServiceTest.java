@@ -4,6 +4,7 @@ package com.fronzec.frbatchservice.batchjobs.plugins.service;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -27,10 +28,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.jar.Attributes;
 import java.util.jar.JarOutputStream;
 import java.util.jar.Manifest;
@@ -44,6 +55,8 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -81,7 +94,6 @@ class JarUploadServiceTest {
     MockMultipartFile file =
         new MockMultipartFile(
             "file", "test-job-1.0.0.jar", "application/java-archive", jarBytes);
-    Path storedPath = jarDir.resolve("test-job-1.0.0.jar");
 
     when(jobDefinitionRepository.findByJobName("test-job")).thenReturn(Optional.empty());
     when(jarSignatureVerifier.verify(any()))
@@ -95,32 +107,217 @@ class JarUploadServiceTest {
             });
 
     JarUploadResponse response;
+    Path storedPath;
     try (MockedStatic<ChecksumUtil> checksum = mockStatic(ChecksumUtil.class)) {
       // Stub only the Path overload: the digest the service stores must come from
       // the persisted file. The multipart overload is left unstubbed so that a
       // regression to hashing the stream would surface a null checksum AND trip
       // the never() verification below.
-      checksum.when(() -> ChecksumUtil.computeSha256(storedPath)).thenReturn("disk-digest");
+      checksum.when(() -> ChecksumUtil.computeSha256(any(Path.class))).thenReturn("disk-digest");
 
       response = service.uploadJar(file, "test-job", "1.0.0", "com.example.MyPlugin");
+
+      ArgumentCaptor<JobDefinitionEntity> captor =
+          ArgumentCaptor.forClass(JobDefinitionEntity.class);
+      verify(jobDefinitionRepository).save(captor.capture());
+      storedPath = Path.of(captor.getValue().getJarFilePath());
+      assertEquals(
+          "disk-digest",
+          captor.getValue().getJarChecksum(),
+          "persisted checksum must be the digest of the stored file");
 
       // The checksum was read from the persisted file, not from the upload stream.
       checksum.verify(() -> ChecksumUtil.computeSha256(storedPath));
       checksum.verify(() -> ChecksumUtil.computeSha256(any(MultipartFile.class)), never());
     }
 
-    ArgumentCaptor<JobDefinitionEntity> captor =
-        ArgumentCaptor.forClass(JobDefinitionEntity.class);
-    verify(jobDefinitionRepository).save(captor.capture());
-
     assertTrue(Files.exists(storedPath), "JAR should be written to disk before hashing");
     assertArrayEquals(
         jarBytes, Files.readAllBytes(storedPath), "stored bytes should match the upload");
-    assertEquals(
-        "disk-digest",
-        captor.getValue().getJarChecksum(),
-        "persisted checksum must be the digest of the stored file");
     assertEquals("disk-digest", response.jarChecksum(), "response must expose the same checksum");
+  }
+
+  // ─── upload JAR storage ────────────────────────────────────────────────────
+
+  @Test
+  @DisplayName("stores an upload under a unique name without overwriting an existing file")
+  void uploadJar_storesUniqueFileWithoutOverwritingExistingJar() throws IOException {
+    Path existing = jarDir.resolve("test-job-1.0.0.jar");
+    Files.write(existing, "existing".getBytes());
+    byte[] jarBytes = minimalJar();
+    when(jobDefinitionRepository.findByJobName("test-job")).thenReturn(Optional.empty());
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(true, null, List.of()));
+    when(jobDefinitionRepository.save(any(JobDefinitionEntity.class)))
+        .thenAnswer(
+            invocation -> {
+              JobDefinitionEntity saved = invocation.getArgument(0);
+              saved.setId(1L);
+              return saved;
+            });
+
+    JarUploadResponse response =
+        service.uploadJar(
+            replacementFile(jarBytes), "test-job", "1.0.0", "com.example.MyPlugin");
+
+    assertTrue(
+        response.jarFileName().matches("test-job-1\\.0\\.0-[0-9a-f]{8}\\.jar"),
+        response.jarFileName());
+    assertArrayEquals(jarBytes, Files.readAllBytes(jarDir.resolve(response.jarFileName())));
+    assertArrayEquals(
+        "existing".getBytes(), Files.readAllBytes(existing), "existing JAR must be untouched");
+  }
+
+  @Test
+  @DisplayName("keeps the winner's JAR and leaves no file when the unique key rejects a duplicate")
+  void uploadJar_duplicateRejectedByUniqueKey_keepsOtherJarAndLeavesNoOwnFile() throws IOException {
+    // The concurrent upload that won the race already stored its JAR and inserted its row.
+    Path winnerJar = jarDir.resolve("test-job-1.0.0.jar");
+    Files.write(winnerJar, "winner".getBytes());
+    when(jobDefinitionRepository.findByJobName("test-job")).thenReturn(Optional.empty());
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(true, null, List.of()));
+    when(jobDefinitionRepository.save(any(JobDefinitionEntity.class)))
+        .thenThrow(new DataIntegrityViolationException("uk_job_name"));
+
+    assertThrows(
+        DuplicateJobDefinitionException.class,
+        () ->
+            service.uploadJar(
+                replacementFile(minimalJar()), "test-job", "1.0.0", "com.example.MyPlugin"));
+
+    assertArrayEquals(
+        "winner".getBytes(), Files.readAllBytes(winnerJar), "the winner's JAR must be untouched");
+    assertEquals(1, filesIn(jarDir), "the losing upload must leave no file of its own");
+  }
+
+  @Test
+  @DisplayName("keeps the stored upload when saving the definition fails with an unknown outcome")
+  void uploadJar_saveFailsWithUnknownOutcome_keepsStoredFile() throws IOException {
+    byte[] jarBytes = minimalJar();
+    when(jobDefinitionRepository.findByJobName("test-job")).thenReturn(Optional.empty());
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(true, null, List.of()));
+    // The row may have committed before the connection failure surfaced.
+    when(jobDefinitionRepository.save(any(JobDefinitionEntity.class)))
+        .thenThrow(new DataAccessResourceFailureException("connection lost"));
+
+    assertThrows(
+        DataAccessResourceFailureException.class,
+        () ->
+            service.uploadJar(
+                replacementFile(jarBytes), "test-job", "1.0.0", "com.example.MyPlugin"));
+
+    try (Stream<Path> files = Files.list(jarDir)) {
+      List<Path> stored = files.toList();
+      assertEquals(1, stored.size(), "the JAR a committed definition may reference must be kept");
+      assertArrayEquals(jarBytes, Files.readAllBytes(stored.get(0)));
+    }
+  }
+
+  @Test
+  @DisplayName("two concurrent uploads of the same job keep the winner's JAR intact")
+  void uploadJar_concurrentDuplicate_neverOverwritesWinnersJar() throws Exception {
+    for (int i = 0; i < 20; i++) {
+      Path dir = Files.createDirectory(jarDir.resolve("race" + i));
+      JobDefinitionRepository repository = mock(JobDefinitionRepository.class);
+      JarSignatureVerifier verifier = mock(JarSignatureVerifier.class);
+      CyclicBarrier bothPassedDuplicateCheck = new CyclicBarrier(2);
+      CountDownLatch bothStored = new CountDownLatch(2);
+      when(repository.findByJobName("test-job"))
+          .thenAnswer(
+              invocation -> {
+                bothPassedDuplicateCheck.await(5, TimeUnit.SECONDS);
+                return Optional.empty();
+              });
+      when(verifier.verify(any()))
+          .thenAnswer(
+              invocation -> {
+                bothStored.countDown();
+                return new SignatureResult(true, null, List.of());
+              });
+      AtomicBoolean first = new AtomicBoolean(true);
+      AtomicReference<JobDefinitionEntity> winner = new AtomicReference<>();
+      when(repository.save(any(JobDefinitionEntity.class)))
+          .thenAnswer(
+              invocation -> {
+                JobDefinitionEntity entity = invocation.getArgument(0);
+                if (!first.compareAndSet(true, false)) {
+                  throw new DataIntegrityViolationException("uk_job_name");
+                }
+                // The loser has stored its file before the winner's insert commits.
+                bothStored.await(5, TimeUnit.SECONDS);
+                entity.setId(1L);
+                winner.set(entity);
+                return entity;
+              });
+      JarUploadService racing =
+          new JarUploadService(
+              repository,
+              Optional.<AutoApproveConfig>empty(),
+              verifier,
+              auditService,
+              pluginMetrics,
+              "permissive",
+              dir.toString());
+
+      ExecutorService pool = Executors.newFixedThreadPool(2);
+      try {
+        List<Future<JarUploadResponse>> uploads = new ArrayList<>();
+        // Different bytes per upload; the mocked verifier never parses the second one.
+        for (byte[] bytes : List.of(minimalJar(), "PK\3\4other".getBytes())) {
+          uploads.add(
+              pool.submit(
+                  () ->
+                      racing.uploadJar(
+                          replacementFile(bytes), "test-job", "1.0.0", "com.example.MyPlugin")));
+        }
+        int duplicates = 0;
+        for (Future<JarUploadResponse> upload : uploads) {
+          try {
+            upload.get(10, TimeUnit.SECONDS);
+          } catch (ExecutionException e) {
+            assertInstanceOf(DuplicateJobDefinitionException.class, e.getCause());
+            duplicates++;
+          }
+        }
+        assertEquals(1, duplicates, "exactly one upload must lose the race");
+        Path winnerJar = Path.of(winner.get().getJarFilePath());
+        assertEquals(
+            winner.get().getJarChecksum(),
+            ChecksumUtil.computeSha256(winnerJar),
+            "the winner's JAR must hold its own bytes");
+        assertEquals(1, filesIn(dir), "the losing upload must leave no file of its own");
+      } finally {
+        pool.shutdownNow();
+      }
+    }
+  }
+
+  @Test
+  @DisplayName("deletes the stored upload when strict signature verification fails")
+  void uploadJar_strictSignatureFailure_rejectsAndDeletesStoredFile() throws IOException {
+    JarUploadService strictService =
+        new JarUploadService(
+            jobDefinitionRepository,
+            Optional.<AutoApproveConfig>empty(),
+            jarSignatureVerifier,
+            auditService,
+            pluginMetrics,
+            "strict",
+            jarDir.toString());
+    when(jobDefinitionRepository.findByJobName("test-job")).thenReturn(Optional.empty());
+    when(jarSignatureVerifier.verify(any()))
+        .thenReturn(new SignatureResult(false, null, List.of("unsigned")));
+
+    assertThrows(
+        InvalidJarException.class,
+        () ->
+            strictService.uploadJar(
+                replacementFile(minimalJar()), "test-job", "1.0.0", "com.example.MyPlugin"));
+
+    assertEquals(0, filesIn(jarDir), "a rejected upload must leave no file");
+    verify(jobDefinitionRepository, never()).save(any());
   }
 
   // ─── replacement JAR storage ───────────────────────────────────────────────
