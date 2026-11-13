@@ -85,7 +85,10 @@ jobs:
   # pass 2 proves the flow is idempotent (re-runs return 409s and still pass).
   contract-test:
     needs: build
-    runs-on: ubuntu-latest
+    # Pinned: the hurl .deb depends on libxml2, which is not installable on
+    # ubuntu-latest (now 26.04 "resolute"). Unpin once hurl ships a package
+    # that installs there.
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: read
