@@ -204,15 +204,17 @@ curl -u admin:admin123 \
   "id": 1,
   "job_name": "payment-job",
   "version": "1.0.0",
-  "main_class_name": "com.example.payment.PaymentJobPlugin",
-  "jar_file_path": "./plugins/jars/payment-job-1.0.0.jar",
-  "sha256_checksum": "abc123...",
-  "uploaded_at": "2024-03-15T10:30:00",
-  "enabled": false,
-  "approval_status": "PENDING",
-  "load_status": "UNLOADED"
+  "jar_checksum": "abc123...",
+  "jar_file_name": "payment-job-1.0.0-3f9a1c2e.jar"
 }
 ```
+
+The JAR is stored under a unique file name (`{jobName}-{version}-{random}.jar`) and never replaces
+an existing file, so concurrent uploads with the same job name cannot overwrite each other's JAR. An
+upload that is rejected after the file was stored, for example a duplicate job name caught by the
+database unique key or a failed strict signature check, deletes the file it stored. Any other
+failure while saving the definition keeps the file, because the definition may have been committed.
+The new definition starts disabled and `UNLOADED`.
 
 ### Approval Workflow
 
