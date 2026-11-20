@@ -84,43 +84,47 @@ example-payment-job/
 - **`maven-shade-plugin`**: Bundles job-specific dependencies (e.g., CSV parsers, HTTP clients)
   while excluding platform libraries to prevent classpath conflicts.
 - **Java 21**: The platform runs on Java 21; plugins must target the same release.
-- **No Spring Boot parent**: Plugins are standalone Maven projects; they don't inherit from Spring
-  Boot's parent POM.
+- **`plugins-parent`**: Plugins inherit `plugins-parent/pom.xml`, which inherits Spring Boot's
+  parent at the same version as `fr-batch-service`. Do not set versions for Spring Batch, Spring,
+  SLF4J, or test libraries in a plugin pom; the parent manages them, so plugins compile and test
+  against the versions the host runs. On a Spring Boot upgrade, the plugins need one change, in
+  `plugins-parent/pom.xml`, next to the `fr-batch-service` and `batch-job-api` parents. Set
+  versions only for job-specific libraries the Boot BOM does not manage.
 
 ```xml
 <project>
   <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>plugins-parent</artifactId>
+    <version>1.0.0</version>
+    <relativePath>../plugins-parent/pom.xml</relativePath>
+  </parent>
+
   <groupId>com.example</groupId>
   <artifactId>example-payment-job</artifactId>
   <version>1.0.0</version>
-
-  <properties>
-    <maven.compiler.release>21</maven.compiler.release>
-  </properties>
 
   <dependencies>
     <dependency>
       <groupId>com.fronzec</groupId>
       <artifactId>batch-job-api</artifactId>
-      <version>0.0.1-SNAPSHOT</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.springframework.batch</groupId>
       <artifactId>spring-batch-core</artifactId>
-      <version>6.0.0</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.springframework</groupId>
       <artifactId>spring-context</artifactId>
-      <version>7.0.1</version>
       <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.springframework</groupId>
       <artifactId>spring-tx</artifactId>
-      <version>7.0.1</version>
       <scope>provided</scope>
     </dependency>
     <!-- Job-specific deps (e.g., payment SDK) go here WITHOUT provided -->
@@ -131,13 +135,11 @@ example-payment-job/
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.6.0</version>
         <executions>
           <execution>
             <phase>package</phase>
             <goals><goal>shade</goal></goals>
             <configuration>
-              <createDependencyReducedPom>false</createDependencyReducedPom>
               <artifactSet>
                 <excludes>
                   <exclude>com.fronzec:batch-job-api</exclude>
