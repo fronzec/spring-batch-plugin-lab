@@ -36,4 +36,6 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD wget -qO- http://localhost:8080/api/batch-service/jobs/plugins || exit 1
 USER appuser
 EXPOSE 8080
-ENTRYPOINT ["java", "-Xmx512m", "-XX:MaxMetaspaceSize=256m", "-jar", "app.jar"]
+# -XX:-UseBASE64Intrinsics is an interim mitigation for CVE-2026-114938 (Java4Shell, #124).
+# Remove it once the runtime image ships Temurin 21.0.13.1+2 or later.
+ENTRYPOINT ["java", "-Xmx512m", "-XX:MaxMetaspaceSize=256m", "-XX:-UseBASE64Intrinsics", "-jar", "app.jar"]
