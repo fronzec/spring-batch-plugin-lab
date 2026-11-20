@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    Keep this version in sync with fr-batch-service/pom.xml: plugins compile and
+    test against the Spring Batch and Spring versions the host actually runs.
+  -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.0.8</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>plugins-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <name>plugins-parent</name>
+  <description>Shared build configuration and platform versions for batch-job plugins</description>
+
+  <properties>
+    <java.version>21</java.version>
+    <batch-job-api.version>0.0.1-SNAPSHOT</batch-job-api.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fronzec</groupId>
+        <artifactId>batch-job-api</artifactId>
+        <version>${batch-job-api.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <!--
+          Plugin JARs are shaded; the host provides batch-job-api, Spring Batch,
+          and Spring, so each plugin excludes them from its shaded artifact.
+        -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <configuration>
+            <createDependencyReducedPom>false</createDependencyReducedPom>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+
+  <repositories>
+    <repository>
+      <id>github</id>
+      <url>https://maven.pkg.github.com/fronzec/spring-batch-plugin-lab</url>
+    </repository>
+  </repositories>
+</project>

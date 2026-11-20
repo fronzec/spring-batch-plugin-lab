@@ -13,7 +13,11 @@ requires it.
 - `fr-batch-service/` — Spring Boot 4 / Spring Batch 6 host, REST API, Flyway migrations, and
   dynamic JAR loader.
 - `ticket-pdf-job/`, `ticket-bundle-job/`, `fault-tolerant-harvester-job/`,
-  `partitioned-harvester-job/` — independently built plugin modules.
+  `partitioned-harvester-job/`, `example-payment-job/` — plugin modules, each built on its own
+  from its directory.
+- `plugins-parent/` — shared plugin parent POM; pins the platform versions (via Spring Boot's
+  parent, same version as `fr-batch-service`) that every plugin inherits. Bump it together with
+  `fr-batch-service` and `batch-job-api` when upgrading Spring Boot.
 - `batch-ops-ui/` — Svelte + Vite dashboard.
 - `scripts/`, `Taskfile.yml`, and `RUNNING_LOCALLY.md` — local-development automation and runbook.
 
